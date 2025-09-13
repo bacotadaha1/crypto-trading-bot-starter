@@ -1,0 +1,61 @@
+﻿services:
+  - type: web
+    name: crypto-bot-api
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: MODEL_PATH
+        value: /data/model.pkl
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+
+  - type: cron
+    name: crypto-bot-update
+    env: docker
+    schedule: "0 6 * * *"
+    command: >-
+      sh -lc 'curl -fsS -X POST
+      -H "X-API-Key: ${API_KEY}"
+      https://$RENDER_EXTERNAL_URL/admin/update'
+
+  - type: cron
+    name: crypto-bot-predict
+    env: docker
+    schedule: "2 6 * * *"
+    command: >-
+      sh -lc 'curl -fsS -X POST
+      -H "X-API-Key: ${API_KEY}"
+      https://$RENDER_EXTERNAL_URL/admin/predict'
+
+  - type: cron
+    name: crypto-bot-eval
+    env: docker
+    schedule: "5 7 * * *"
+    command: >-
+      sh -lc 'curl -fsS -X POST
+      -H "X-API-Key: ${API_KEY}"
+      https://$RENDER_EXTERNAL_URL/admin/eval'
+
+  - type: cron
+    name: crypto-bot-ml-dataset-weekly
+    env: docker
+    schedule: "0 6 * * MON"
+    command: >-
+      sh -lc 'curl -fsS -X POST
+      -H "X-API-Key: ${API_KEY}"
+      https://$RENDER_EXTERNAL_URL/admin/ml_dataset'
+
+  - type: cron
+    name: crypto-bot-train-weekly
+    env: docker
+    schedule: "10 6 * * MON"
+    command: >-
+      sh -lc 'curl -fsS -X POST
+      -H "X-API-Key: ${API_KEY}"
+      https://$RENDER_EXTERNAL_URL/admin/train'
