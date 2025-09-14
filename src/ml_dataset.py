@@ -67,5 +67,6 @@ def create_dataset(symbols=None, years=4, horizon=1, timeframe=None, out_csv=Non
     all_df.to_csv(out_csv, index=True)
     print(f"[DONE] Dataset ML -> {out_csv} ({len(all_df)} lignes)")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     create_dataset()
+

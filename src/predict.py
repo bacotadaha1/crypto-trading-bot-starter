@@ -61,5 +61,6 @@ def predict_once():
     print("predict_once: OK")
     return results
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     predict_once()
+

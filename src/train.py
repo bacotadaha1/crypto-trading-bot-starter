@@ -29,5 +29,6 @@ def train_and_save(csv_path=None, model_path=None):
     joblib.dump({"model": clf, "features": FEATURES}, model_path)
     print(f"[SAVE] {model_path}")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     train_and_save()
+

@@ -34,7 +34,7 @@ def make_client():
 
 class ExchangeClient:
     """Compat : un wrapper qui expose .client, en s'appuyant sur make_client()."""
-    def _init_(self):
+    def __init__(self):
         self.client = make_client()
 
 def load_all_symbols() -> dict[str, pd.DataFrame]:
@@ -53,3 +53,4 @@ def load_all_symbols() -> dict[str, pd.DataFrame]:
     if not out:
         raise RuntimeError("Aucune donnée chargée : vérifie SYMBOLS/TIMEFRAME/LIMIT ou la connexion Internet.")
     return out
+
