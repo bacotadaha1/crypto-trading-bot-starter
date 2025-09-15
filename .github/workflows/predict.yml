@@ -1,0 +1,49 @@
+﻿name: Daily Predict
+
+on:
+  schedule:
+    - cron: "50 7 * * *"  # tous les jours à 07:50 UTC (~ 08:50 Paris/Rome)
+  workflow_dispatch: {}   # déclenchement manuel possible
+
+jobs:
+  run-predict:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # joblib peut ne pas être listé selon ton repo
+          pip install joblib requests
+
+      - name: Run prediction
+        env:
+          EXCHANGE: ${{ secrets.EXCHANGE }}
+          API_KEY: ${{ secrets.API_KEY }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+          USE_TESTNET: ${{ secrets.USE_TESTNET }}
+          SYMBOLS: ${{ secrets.SYMBOLS }}
+          TIMEFRAME: ${{ secrets.TIMEFRAME }}
+          LIMIT: ${{ secrets.LIMIT }}
+          VOL_WINDOW: ${{ secrets.VOL_WINDOW }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TRADE_ENABLED: "false"
+          DATA_DIR: "./data"
+        run: |
+          python -m src.predict
+
+      - name: Upload artifacts (logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: predict-logs
+          path: data/predictions_*.json
+          if-no-files-found: ignore
