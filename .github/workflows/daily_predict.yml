@@ -1,0 +1,41 @@
+﻿name: Daily Predict (Telegram)
+
+on:
+  schedule:
+    - cron: "0 6 * * *"     # tous les jours 06:00 UTC (≈ 08:00 Europe centrale)
+  workflow_dispatch:
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+
+    env:
+      EXCHANGE: ${{ secrets.EXCHANGE }}
+      USE_TESTNET: ${{ secrets.USE_TESTNET }}
+      SYMBOLS: ${{ secrets.SYMBOLS }}
+      TIMEFRAME: ${{ secrets.TIMEFRAME }}
+      LIMIT: ${{ secrets.LIMIT }}
+      DATA_DIR: ${{ secrets.DATA_DIR }}
+      TRADE_ENABLED: ${{ secrets.TRADE_ENABLED }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      API_KEY: ${{ secrets.API_KEY }}
+      API_SECRET: ${{ secrets.API_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run daily prediction (sends Telegram)
+        run: |
+          python -m src.predict
