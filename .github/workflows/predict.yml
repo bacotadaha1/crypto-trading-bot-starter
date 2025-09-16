@@ -30,11 +30,10 @@ jobs:
           touch src/__init__.py
           touch src/api/__init__.py
 
-      - name: Train then Predict
+            - name: Train then Predict
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # valeurs par défaut (pas besoin de secrets pour celles-ci)
           EXCHANGE: bybit
           USE_TESTNET: "false"
           TIMEFRAME: "4h"
@@ -43,8 +42,11 @@ jobs:
           VOL_WINDOW: "20"
           DATA_DIR: "./data"
         run: |
-          python -m src.train_model
-          python -m src.predict
+          echo "Working dir: $(pwd)"
+          ls -R
+          python src/train_model.py
+          python src/predict.py
+
 
       - name: Upload artifacts (logs)
         uses: actions/upload-artifact@v4
