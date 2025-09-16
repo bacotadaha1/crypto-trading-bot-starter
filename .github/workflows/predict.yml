@@ -46,13 +46,3 @@ jobs:
           ls -R
           python src/train_model.py
           python src/predict.py
-
-
-      - name: Upload artifacts (logs)
-        uses: actions/upload-artifact@v4
-        with:
-          name: predict-logs
-          path: |
-            data/predictions_*.json
-            data/pred_*.csv
-          if-no-files-found: ignore
