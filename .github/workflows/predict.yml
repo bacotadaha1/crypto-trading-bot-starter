@@ -2,8 +2,8 @@ name: Daily Predict
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 06:00 UTC = 08:00 Cameroun/Italie
-  workflow_dispatch: {}    # bouton "Run workflow"
+    - cron: "0 6 * * *"    # 06:00 UTC = 08:00 chez toi
+  workflow_dispatch: {}     # bouton "Run workflow"
 
 jobs:
   run-predict:
@@ -21,7 +21,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # au cas où ce n'est pas listé
+          # sécurité si non listé
           pip install joblib requests
 
       - name: Ensure package structure
@@ -30,7 +30,7 @@ jobs:
           touch src/__init__.py
           touch src/api/__init__.py
 
-            - name: Train then Predict
+      - name: Run daily prediction (sends Telegram)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -44,5 +44,13 @@ jobs:
         run: |
           echo "Working dir: $(pwd)"
           ls -R
-          python src/train_model.py
           python src/predict.py
+
+      - name: Upload artifacts (logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: predict-logs
+          path: |
+            data/predictions_*.json
+            data/pred_*.csv
+          if-no-files-found: ignore
