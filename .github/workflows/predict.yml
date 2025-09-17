@@ -44,7 +44,8 @@ jobs:
         run: |
           echo "Working dir: $(pwd)"
           ls -R
-          python src/predict.py
+          export PYTHONPATH="$PWD"
+          python -m src.predict
 
       - name: Upload artifacts (logs)
         uses: actions/upload-artifact@v4
