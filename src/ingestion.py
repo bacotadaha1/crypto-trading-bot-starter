@@ -14,4 +14,3 @@ def make_client():
         raise ValueError(f"L'exchange {ex_id} ne supporte pas fetchOHLCV")
 
     return ex
-
