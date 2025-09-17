@@ -2,8 +2,9 @@
 from .config import settings
 
 def make_client():
-    ex_id = settings.exchange_id.lower()
-    if not hasattr(ccxt, ex_id):
+    ex_id = settings.exchange.lower()
+
+if not hasattr(ccxt, ex_id):
         raise ValueError(f"Exchange inconnu dans ccxt: {ex_id}")
     ex_cls = getattr(ccxt, ex_id)
     ex = ex_cls({"enableRateLimit": True})
