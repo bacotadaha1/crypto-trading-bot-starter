@@ -11,19 +11,6 @@ permissions:
 jobs:
   retrain:
     runs-on: ubuntu-latest
-
-    env:
-      EXCHANGE: ${{ secrets.EXCHANGE }}
-      USE_TESTNET: ${{ secrets.USE_TESTNET }}
-      SYMBOLS: ${{ secrets.SYMBOLS }}
-      TIMEFRAME: ${{ secrets.TIMEFRAME }}
-      LIMIT: ${{ secrets.LIMIT }}
-      DATA_DIR: ${{ secrets.DATA_DIR }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      API_KEY: ${{ secrets.API_KEY }}
-      API_SECRET: ${{ secrets.API_SECRET }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,20 +24,28 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install joblib requests
+
+      - name: Ensure package structure
+        run: |
+          mkdir -p src/api
+          touch src/__init__.py
+          touch src/api/__init__.py
 
       - name: Fetch OHLCV (~4y) & train models
+        env:
+          EXCHANGE: ${{ secrets.EXCHANGE }}
+          API_KEY: ${{ secrets.API_KEY }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+          USE_TESTNET: ${{ secrets.USE_TESTNET }}
+          TIMEFRAME: "4h"
+          SYMBOLS: "BTC/USDT,ETH/USDT,SOL/USDT"
+          LIMIT: "2000"
+          VOL_WINDOW: "20"
+          DATA_DIR: "./data"
         run: |
-          python -m src.ingestion
-          python -m src.train_model
-
-      - name: Commit updated models & report
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add models/*.pkl data/ml_training_report.csv || true
-          if ! git diff --cached --quiet; then
-            git commit -m "ci: daily retrain models"
-            git push
-          else
-            echo "No changes to commit."
-          fi
+          echo "Working dir: $(pwd)"
+          ls -R
+          export PYTHONPATH="$PWD"
+          python -m src.ingestion   # optionnel: vérifie que l'import passe
+          python -m src.train       # <== IMPORTANT : on lance train.py comme module
