@@ -21,7 +21,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # sécurité si non listé
+          # ceinture et bretelles si non listés :
           pip install joblib requests
 
       - name: Ensure package structure
@@ -32,15 +32,12 @@ jobs:
 
       - name: Run daily prediction (sends Telegram)
         env:
+          EXCHANGE: ${{ secrets.EXCHANGE }}               # ex: binance
+          SYMBOLS: ${{ secrets.SYMBOLS }}                 # ex: BTC/USDT,ETH/USDT,SOL/USDT
+          TIMEFRAME: ${{ secrets.TIMEFRAME }}             # ex: 4h
+          LIMIT: ${{ secrets.LIMIT }}                     # ex: 1200 ou 2000
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          EXCHANGE: bybit
-          USE_TESTNET: "false"
-          TIMEFRAME: "4h"
-          SYMBOLS: "BTC/USDT,ETH/USDT,SOL/USDT"
-          LIMIT: "2000"
-          VOL_WINDOW: "20"
-          DATA_DIR: "./data"
         run: |
           echo "Working dir: $(pwd)"
           ls -R
