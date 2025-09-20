@@ -2,8 +2,8 @@ name: Daily Retrain Models
 
 on:
   schedule:
-    - cron: "30 5 * * *"    # 05:30 UTC = 07:30 chez toi
-  workflow_dispatch: {}     # bouton "Run workflow"
+    - cron: "30 5 * * *"     # 05:30 UTC (avant la prédiction)
+  workflow_dispatch: {}
 
 jobs:
   retrain:
@@ -23,25 +23,17 @@ jobs:
           pip install -r requirements.txt
           pip install joblib requests
 
-      - name: Ensure package structure
-        run: |
-          mkdir -p src/api
-          touch src/__init__.py
-          touch src/api/__init__.py
-
       - name: Fetch OHLCV (~4y) & train models
         env:
-          EXCHANGE: ${{ secrets.EXCHANGE }}               # binance
-          SYMBOLS: ${{ secrets.SYMBOLS }}                 # BTC/USDT,ETH/USDT,SOL/USDT
-          TIMEFRAME: ${{ secrets.TIMEFRAME }}             # 4h
-          LIMIT: ${{ secrets.LIMIT }}                     # 1200 ou 2000
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EXCHANGE: kraken
+          SYMBOLS: BTC/USDT,ETH/USDT,SOL/USDT
+          TIMEFRAME: 4h
+          LIMIT: "1500"
+          DATA_DIR: ./data
         run: |
-          echo "Working dir: $(pwd)"
-          ls -R
-          export PYTHONPATH="$PWD"
-          python -m src.train     # on lance train.py
+          # crée le CSV si manquant puis entraîne
+          python -c "from src.train import ensure_training_csv; ensure_training_csv()"
+          python -m src.train
 
       - name: Upload training artifacts
         uses: actions/upload-artifact@v4
@@ -50,5 +42,5 @@ jobs:
           path: |
             data/training_data.csv
             data/ml_training_report.csv
-            models/*.pkl
-          if-no-files-found: ignore
+            models/
+          if-no-files-found: warn
