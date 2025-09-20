@@ -3,3 +3,6 @@
 _pycache_/
 data/
 *.log
+# --- garder les modèles entraînés dans le repo ---
+!models/
+!models/*.pkl
