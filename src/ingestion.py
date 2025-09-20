@@ -1,30 +1,29 @@
+# src/ingestion.py
 import ccxt
 from src.config import settings
 
 
 def make_client():
     """
-    Crée un client CCXT pour l'exchange choisi (Kraken par défaut).
-    Pas besoin de clés si on récupère juste l'OHLCV.
+    Crée et retourne un client CCXT configuré selon settings.exchange.
+    - Fonctionne sans clés API pour les données OHLCV publiques.
+    - Si des clés existent dans les secrets, elles seront utilisées automatiquement.
+    - Charge aussi les markets pour éviter les erreurs de symboles.
     """
-    ex_id = settings.exchange.lower()
+    ex_id = settings.exchange_id()
     if not hasattr(ccxt, ex_id):
-        raise ValueError(f"Exchange inconnu : {ex_id}")
+        raise ValueError(f"Exchange {ex_id} non supporté par CCXT.")
 
     ex_cls = getattr(ccxt, ex_id)
-    args = {"enableRateLimit": True}
+    ex = ex_cls(settings.ccxt_kwargs())
 
-    # Si tu renseignes API_KEY/SECRET (trading live), on les branche :
-    if settings.api_key and settings.api_secret:
-        args["apiKey"] = settings.api_key
-        args["secret"] = settings.api_secret
+    try:
+        ex.load_markets()
+    except Exception as e:
+        raise RuntimeError(f"Impossible de charger les marchés pour {ex_id}: {e}")
 
-    ex = ex_cls(args)
-    ex.load_markets()
-
-    # Vérification basique qu'on peut bien fetch l'OHLCV
-    # (certains exchanges n'ont pas OHLCV pour tous les symboles)
+    # Vérifie si l’exchange supporte OHLCV
     if not ex.has.get("fetchOHLCV", False):
-        raise ValueError(f"L'exchange {ex_id} ne supporte pas fetchOHLCV")
+        raise ValueError(f"L’exchange {ex_id} ne supporte pas fetchOHLCV (OHLCV indisponible).")
 
     return ex
