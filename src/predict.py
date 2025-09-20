@@ -70,28 +70,21 @@ def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
-def load_model_for(symbol: str) -> Path | None:
-    # essaie plusieurs conventions vues pendant l'entraînement
-    candidates = [
-        Path("models")/f"model1_{_sym_to_fname(symbol)}.pkl",
-        Path("models")/"model1.pkl",
-        Path(settings.model_path) if hasattr(settings, "model_path") else Path("models/model1.pkl"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
+def load_model_for(symbol: str):
+    """
+    Charge le modèle sauvegardé pour un symbole (ex: models/BTC_USDT_model.pkl).
+    """
+    path = Path("models") / f"{symbol.replace('/', '_')}_model.pkl"
+    if not path.exists():
+        raise FileNotFoundError(f"Aucun modèle trouvé pour {symbol} dans ./models/")
+    return joblib.load(path)
 
 def predict_one_symbol(ex, symbol: str) -> dict:
     df = fetch_ohlcv_df(ex, symbol, settings.timeframe, settings.limit)
     X, df_full = _build_features(df, settings.vol_window)
 
-    model_path = load_model_for(symbol)
-    if model_path is None:
-        raise FileNotFoundError(f"Aucun modèle trouvé pour {symbol} dans ./models/")
-
-    model = joblib.load(model_path)
-
+    model = load_model_for(symbol)
+ 
     # on prend la dernière ligne de features
     x_last = X.iloc[-1:].copy()
 
