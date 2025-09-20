@@ -5,8 +5,9 @@ pyarrow==17.0.0
 ta==0.11.0
 vectorbt==0.28.1
 
-# On force Pydantic v1 (stable avec ton code existant)
-pydantic==1.10.12
+# Pydantic v2 pour compat Prefect 3
+pydantic==2.8.2
+pydantic-core==2.18.4
 
 python-dotenv==1.0.1
 prefect==3.0.0
@@ -14,6 +15,5 @@ loguru==0.7.2
 redis==5.0.8
 matplotlib==3.9.2
 
-# utiles pour tes scripts
 joblib==1.4.2
 requests==2.32.3
