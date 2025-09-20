@@ -5,6 +5,9 @@ on:
     - cron: "30 5 * * *"     # 05:30 UTC (avant la prédiction)
   workflow_dispatch: {}
 
+  permissions:
+  contents: write   # <— nécessaire pour pousser les modèles
+
 jobs:
   retrain:
     runs-on: ubuntu-latest
@@ -34,6 +37,16 @@ jobs:
           # crée le CSV si manquant puis entraîne
           python -c "from src.train import ensure_training_csv; ensure_training_csv()"
           python -m src.train
+
+      - name: Commit updated models & report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add models/* || true
+          git commit -m "Update trained models" || echo "Nothing to commit"
+          git push
 
       - name: Upload training artifacts
         uses: actions/upload-artifact@v4
