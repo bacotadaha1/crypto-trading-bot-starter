@@ -1,6 +1,8 @@
 import time
 from pathlib import Path
 import pandas as pd
+import joblib   # <-- AJOUT
+from sklearn.linear_model import LinearRegression  # <-- AJOUT pour un modèle simple
 
 from src.config import settings
 from src.ingestion import make_client
@@ -68,18 +70,35 @@ def ensure_training_csv() -> None:
 
 def train_models():
     """
-    Exemple très simple : charge le CSV et simule un entraînement.
-    Remplace par ton vrai code d’entraînement si déjà présent dans le repo.
+    Exemple simple : pour chaque symbole, on entraîne une régression linéaire
+    close(t-1) -> close(t) et on sauvegarde un modèle dans ./models/
     """
     df = pd.read_csv(CSV_PATH)
     print(f"📦 training_data.csv lu : {len(df)} lignes, {df['symbol'].nunique()} symboles.")
-    # ... Ici ton code: features, split, fit, save models ...
-    # Sauvegardons un petit fichier rapport pour tracer le run :
-    (DATA_DIR / "ml_training_report.csv").write_text(
-        f"rows,{len(df)}\nsymbols,{','.join(sorted(df['symbol'].unique()))}\n",
-        encoding="utf-8"
-    )
-    print("✅ Entraînement terminé (rapport écrit).")
+
+    # Créer le dossier models/ si absent
+    MODELS_DIR = Path("models")
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    for sym, grp in df.groupby("symbol"):
+        grp = grp.sort_values("timestamp").reset_index(drop=True)
+        grp["close_lag1"] = grp["close"].shift(1)
+        grp = grp.dropna().reset_index(drop=True)
+
+        if len(grp) < 50:
+            print(f"⚠️ Trop peu de données pour {sym}, on saute.")
+            continue
+
+        X = grp[["close_lag1"]].values
+        y = grp["close"].values
+
+        model = LinearRegression()
+        model.fit(X, y)
+
+        model_path = MODELS_DIR / f"{sym.replace('/', '_')}_model.pkl"
+        joblib.dump(model, model_path)
+        print(f"✅ Modèle sauvegardé : {model_path}")
+
 
 
 def main():
