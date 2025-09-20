@@ -5,9 +5,8 @@ pyarrow==17.0.0
 ta==0.11.0
 vectorbt==0.28.1
 
-# Pydantic v2 pour compat Prefect 3
+# Pydantic v2 (pip choisira la bonne version de pydantic-core automatiquement)
 pydantic==2.8.2
-pydantic-core==2.18.4
 
 python-dotenv==1.0.1
 prefect==3.0.0
