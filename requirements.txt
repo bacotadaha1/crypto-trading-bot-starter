@@ -4,13 +4,18 @@ numpy==1.26.4
 pyarrow==17.0.0
 ta==0.11.0
 vectorbt==0.28.1
-pydantic==2.7.4
-fastapi==0.111.0
-uvicorn==0.30.1
+
+# ⚙️ Pydantic v1 + FastAPI compatible
+pydantic==1.10.12
+fastapi==0.95.2
+uvicorn==0.22.0
+
 python-dotenv==1.0.1
 prefect==3.0.0
 loguru==0.7.2
 redis==5.0.8
 matplotlib==3.9.2
-scikit-learn==1.5.1
+
+# utiles pour tes scripts
+joblib==1.4.2
 requests==2.32.3
