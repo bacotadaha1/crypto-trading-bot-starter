@@ -5,10 +5,8 @@ pyarrow==17.0.0
 ta==0.11.0
 vectorbt==0.28.1
 
-# ⚙️ Pydantic v1 + FastAPI compatible
+# On force Pydantic v1 (stable avec ton code existant)
 pydantic==1.10.12
-fastapi==0.95.2
-uvicorn==0.22.0
 
 python-dotenv==1.0.1
 prefect==3.0.0
