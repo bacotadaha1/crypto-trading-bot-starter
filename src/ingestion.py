@@ -8,16 +8,14 @@ def make_client():
 
     ex_cls = getattr(ccxt, ex_id)
 
-    # N'utilise apiKey/secret que si fournis (Binance spot n'en a pas besoin pour OHLCV)
     kwargs = {"enableRateLimit": True}
-    if getattr(settings, "api_key", "") and getattr(settings, "api_secret", ""):
+    if settings.api_key and settings.api_secret:
         kwargs["apiKey"] = settings.api_key
         kwargs["secret"] = settings.api_secret
 
     ex = ex_cls(kwargs)
 
-    # Testnet seulement si tu réactives plus tard (pas utile pour Binance spot)
-    if getattr(settings, "use_testnet", False) and hasattr(ex, "set_sandbox_mode"):
+    if settings.use_testnet and hasattr(ex, "set_sandbox_mode"):
         ex.set_sandbox_mode(True)
 
     ex.load_markets()
