@@ -1,12 +1,9 @@
-﻿name: Daily Retrain Models
+name: Daily Retrain Models
 
 on:
   schedule:
-    - cron: "0 3 * * *"     # tous les jours 03:00 UTC (avant la prédiction)
-  workflow_dispatch:
-
-permissions:
-  contents: write  # nécessaire pour git push
+    - cron: "30 5 * * *"    # 05:30 UTC = 07:30 chez toi
+  workflow_dispatch: {}     # bouton "Run workflow"
 
 jobs:
   retrain:
@@ -34,18 +31,24 @@ jobs:
 
       - name: Fetch OHLCV (~4y) & train models
         env:
-          EXCHANGE: ${{ secrets.EXCHANGE }}
-          API_KEY: ${{ secrets.API_KEY }}
-          API_SECRET: ${{ secrets.API_SECRET }}
-          USE_TESTNET: ${{ secrets.USE_TESTNET }}
-          TIMEFRAME: "4h"
-          SYMBOLS: "BTC/USDT,ETH/USDT,SOL/USDT"
-          LIMIT: "2000"
-          VOL_WINDOW: "20"
-          DATA_DIR: "./data"
+          EXCHANGE: ${{ secrets.EXCHANGE }}               # binance
+          SYMBOLS: ${{ secrets.SYMBOLS }}                 # BTC/USDT,ETH/USDT,SOL/USDT
+          TIMEFRAME: ${{ secrets.TIMEFRAME }}             # 4h
+          LIMIT: ${{ secrets.LIMIT }}                     # 1200 ou 2000
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           echo "Working dir: $(pwd)"
           ls -R
           export PYTHONPATH="$PWD"
-          python -m src.ingestion   # optionnel: vérifie que l'import passe
-          python -m src.train       # <== IMPORTANT : on lance train.py comme module
+          python -m src.train     # on lance train.py
+
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-artifacts
+          path: |
+            data/training_data.csv
+            data/ml_training_report.csv
+            models/*.pkl
+          if-no-files-found: ignore
