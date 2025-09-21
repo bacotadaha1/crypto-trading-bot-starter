@@ -1,40 +1,35 @@
 # src/predict.py
 from __future__ import annotations
+
 import math
 import json
 from pathlib import Path
 from datetime import datetime, timezone
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import joblib
 
 from src.config import settings
 from src.ingestion import make_client
 
+# -------------------------------------------------------------------
+# Helpers (symboles & chemins)
+# -------------------------------------------------------------------
+def _canonical(symbol: str) -> str:
+    """Toujours utiliser le format CCXT avec des slashes."""
+    return symbol.replace("-", "/").strip()
 
-# ---------- helpers ----------
-def _exchange_symbol(exchange_id: str, human_symbol: str) -> str:
-    """BTC/USDT -> BTC-USDT pour kucoin/okx/bybit, sinon laisse tel quel."""
-    dash_exchanges = {"kucoin", "okx", "bybit"}
-    if exchange_id in dash_exchanges:
-        return human_symbol.replace("/", "-")
-    return human_symbol
-
-
-def _model_path(human_symbol: str) -> Path:
-    """Chemin du modèle pour un symbole humain (ex: models/BTC_USDT_model.pkl)."""
-    return Path("models") / f"{human_symbol.replace('/', '_')}_model.pkl"
+def _storage_key(symbol: str) -> str:
+    """Clé adaptée pour les noms de fichiers (avec underscores)."""
+    return _canonical(symbol).replace("/", "_")
 
 
+# -------------------------------------------------------------------
+# Features identiques à l'entraînement
+# -------------------------------------------------------------------
 def _build_features(df: pd.DataFrame, vol_window: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    EXACTEMENT les mêmes features que dans train.py :
-    ret_1, roll_mean, roll_std, rsi, hl_range, price_z, volume.
-    Retourne (X, df_full_après_dropna).
-    """
     df = df.copy()
-
     df["ret_1"] = df["close"].pct_change()
     df["roll_mean"] = df["close"].rolling(vol_window).mean()
     df["roll_std"] = df["close"].rolling(vol_window).std()
@@ -52,8 +47,7 @@ def _build_features(df: pd.DataFrame, vol_window: int) -> tuple[pd.DataFrame, pd
 
     df = df.dropna().copy()
     feats = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
-    X = df[feats].copy()
-    return X, df
+    return df[feats].copy(), df
 
 
 def _send_telegram(msg: str):
@@ -73,89 +67,89 @@ def _send_telegram(msg: str):
         print("[WARN] Telegram error:", e)
 
 
-def _fetch_ohlcv_df(ex, human_symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-    ex_id = getattr(ex, "id", str(settings.exchange)).lower()
-    ex_symbol = _exchange_symbol(ex_id, human_symbol)
-    ohlcv = ex.fetch_ohlcv(ex_symbol, timeframe=timeframe, limit=limit)
+def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    sym = _canonical(symbol)
+    ohlcv = ex.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
 
-def _load_model(human_symbol: str):
-    path = _model_path(human_symbol)
+def load_model_for(symbol: str):
+    path = Path("models") / f"{_storage_key(symbol)}_model.pkl"
     if not path.exists():
-        raise FileNotFoundError(f"Aucun modèle trouvé pour {human_symbol} dans ./models/")
+        raise FileNotFoundError(f"Aucun modèle trouvé pour {symbol} dans ./models/")
     return joblib.load(path), path
 
 
-def _predict_one(ex, human_symbol: str) -> dict:
-    # 1) données récentes
-    df = _fetch_ohlcv_df(ex, human_symbol, settings.timeframe, settings.limit)
-    if df.empty or len(df) < 50:
-        raise RuntimeError(f"Trop peu de données OHLCV pour {human_symbol}")
-
-    # 2) features (identiques à train)
+def predict_one_symbol(ex, symbol: str) -> dict:
+    df = fetch_ohlcv_df(ex, symbol, settings.timeframe, settings.limit)
     X, df_full = _build_features(df, settings.vol_window)
-    if len(X) == 0:
-        raise RuntimeError(f"Aucune ligne de features après dropna pour {human_symbol}")
 
-    # 3) charger le modèle du symbole
-    model, path = _load_model(human_symbol)
+    model, model_path = load_model_for(symbol)
 
-    # 4) prédire la dernière bougie
-    x_last = X.iloc[-1:].values
+    # dernière ligne
+    x_last = X.iloc[-1:].copy().values
 
+    # proba / direction
+    proba_up = None
+    y_hat = None
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(x_last)
-        p_up = float(proba[0, -1])  # dernière colonne = classe "UP"
-        direction = "UP" if p_up >= 0.5 else "DOWN"
+        proba_up = float(proba[0, -1])
+        y_hat = int(proba_up >= 0.5)
     else:
-        # fallback régression -> signe = direction, squash -> [0,1]
         y_val = float(model.predict(x_last)[0])
-        p_up = 1.0 / (1.0 + math.exp(-10 * y_val))
-        direction = "UP" if y_val >= 0 else "DOWN"
+        proba_up = 1.0 / (1.0 + math.exp(-10 * y_val))
+        y_hat = int(y_val >= 0)
 
     last_close = float(df_full["close"].iloc[-1])
     tstamp = df_full["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
 
     return {
-        "symbol": human_symbol,
+        "symbol": _canonical(symbol),
         "time": tstamp,
         "last_close": last_close,
-        "p_up": p_up,
-        "direction": direction,
-        "model_path": str(path),
+        "p_up": proba_up,
+        "direction": "UP" if y_hat == 1 else "DOWN",
+        "model_file": str(model_path),  # évite le warning pydantic
     }
 
 
 def main():
     ex = make_client()
-
     results = []
-    for sym in settings.symbols:
+    for symbol in settings.symbols:
         try:
-            results.append(_predict_one(ex, sym))
+            r = predict_one_symbol(ex, symbol)
+            results.append(r)
         except Exception as e:
-            results.append({"symbol": sym, "error": str(e)})
+            results.append({"symbol": _canonical(symbol), "error": str(e)})
 
     # message Telegram
     lines = [
         "*Signal quotidien (ML)*",
-        f"Exchange: `{settings.exchange}`   testnet: `{settings.use_testnet}`",
-        f"Timeframe: `{settings.timeframe}`   Limit: `{settings.limit}`",
+        f"Exchange: `***`  testnet: `{settings.use_testnet}`",
+        f"Timeframe: `***`  Limit: `{settings.limit}`",
         "",
     ]
     for r in results:
         if "error" in r:
             lines.append(f"• *{r['symbol']}* → `ERREUR`: {r['error']}")
-        else:
-            conf = int(round(r["p_up"] * 100))
-            arrow = "🟢⬆️" if r["direction"] == "UP" else "🔴⬇️"
-            lines.append(
-                f"• *{r['symbol']}* @ {r['time']}  {arrow}\n"
-                f"  Direction: *{r['direction']}*  | Confiance: *{conf}%*  | Close: `{r['last_close']}`"
-            )
+            continue
+        conf = int(round(r["p_up"] * 100))
+        lines.append(
+            f"• *{r['symbol']}* @ {r['time']}  🔴⬇️\n"
+            if r["direction"] == "DOWN"
+            else f"• *{r['symbol']}* @ {r['time']}  🟢⬆️\n"
+            + f"  Direction: *{r['direction']}*  | Confiance: *{conf}%*  | Close: `{r['last_close']}`"
+        )
+        # réécrit proprement la ligne complète
+        lines[-1] = (
+            f"• *{r['symbol']}* @ {r['time']}  "
+            f"{'🟢⬆️' if r['direction']=='UP' else '🔴⬇️'}\n"
+            f"  Direction: *{r['direction']}*  | Confiance: *{conf}%*  | Close: `{r['last_close']}`"
+        )
 
     msg = "\n".join(lines)
     print(msg)
