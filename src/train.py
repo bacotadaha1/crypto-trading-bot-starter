@@ -2,15 +2,14 @@
 from __future__ import annotations
 import time
 from pathlib import Path
-
-import numpy as np
+from datetime import datetime, timezone, timedelta
 import pandas as pd
+import numpy as np
 import joblib
 
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import accuracy_score, f1_score
 
 from src.config import settings
 from src.ingestion import make_client
@@ -19,47 +18,90 @@ DATA_DIR = settings.data_dir
 CSV_PATH = DATA_DIR / "training_data.csv"
 MODELS_DIR = Path("models")
 
+# ---------- features identiques train/predict ----------
+def build_features(df: pd.DataFrame, vol_window: int) -> tuple[pd.DataFrame, pd.Series]:
+    df = df.copy()
+    df["ret_1"] = df["close"].pct_change()
+    roll = df["close"].rolling(vol_window)
+    df["roll_mean"] = roll.mean()
+    df["roll_std"]  = roll.std()
 
-# ----------------- utils OHLCV -----------------
-def _parse_symbols() -> list[str]:
-    if isinstance(settings.symbols, (list, tuple)):
-        return [s.strip() for s in settings.symbols if s.strip()]
-    if isinstance(settings.symbols, str):
-        return [s.strip() for s in settings.symbols.split(",") if s.strip()]
-    return ["BTC/USDT"]
+    # RSI simple (14)
+    delta = df["close"].diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=df.index).rolling(14).mean()
+    roll_down = pd.Series(down, index=df.index).rolling(14).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-def _safe_fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int, retries: int = 4, backoff: float = 2.0):
-    for i in range(retries):
-        try:
-            return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        except Exception:
-            if i == retries - 1:
-                raise
-            time.sleep(backoff * (i + 1))
+    df["hl_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
+    df["price_z"] = (df["close"] - df["roll_mean"]) / (df["roll_std"].replace(0, np.nan))
 
-def ensure_training_csv() -> None:
-    """
-    Si data/training_data.csv n'existe pas, on le génère depuis l'exchange.
-    """
+    # cible: up si close(t+1) > close(t)
+    df["target_up"] = (df["close"].shift(-1) > df["close"]).astype(int)
+
+    df = df.dropna().copy()
+    feats = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
+    X = df[feats].astype(float).values
+    y = df["target_up"].astype(int).values
+    return X, y, df
+
+# ---------- téléchargement OHLCV ~4 ans (pagination robuste) ----------
+_MS_IN_MIN = 60_000
+
+def _timeframe_to_ms(tf: str) -> int:
+    # ccxt timeframe like "4h", "1h", "1d"
+    unit = tf[-1]
+    n = int(tf[:-1])
+    if unit == "m":
+        return n * _MS_IN_MIN
+    if unit == "h":
+        return n * 60 * _MS_IN_MIN
+    if unit == "d":
+        return n * 24 * 60 * _MS_IN_MIN
+    raise ValueError(f"timeframe inconnu: {tf}")
+
+def fetch_ohlcv_since(ex, symbol: str, timeframe: str, since_ms: int, limit_per_call: int = 1000):
+    out = []
+    tf_ms = _timeframe_to_ms(timeframe)
+    cursor = since_ms
+    while True:
+        batch = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=limit_per_call)
+        if not batch:
+            break
+        out.extend(batch)
+        last_ts = batch[-1][0]
+        # avance d'un pas de timeframe pour éviter de retélécharger le dernier point
+        cursor = last_ts + tf_ms
+        # sécurité anti-rate limit
+        time.sleep(ex.rateLimit / 1000)
+        # si on n'avance plus, on sort
+        if len(batch) < limit_per_call:
+            break
+    return out
+
+def ensure_training_csv_years(years: int = 4) -> None:
     if CSV_PATH.exists():
         print(f"✅ {CSV_PATH} existe déjà — on continue.")
         return
 
-    print("⚠️  training_data.csv introuvable — génération automatique depuis l'exchange…")
+    print(f"⚠️  training_data.csv introuvable — téléchargement ~{years} ans…")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     ex = make_client()
-    symbols = _parse_symbols()
+    symbols = [s.strip() for s in (settings.symbols if isinstance(settings.symbols, (list, tuple)) else settings.symbols.split(","))]
     timeframe = settings.timeframe
-    limit = settings.limit
+
+    since_dt = datetime.now(timezone.utc) - timedelta(days=365*years + 7)  # marge
+    since_ms = int(since_dt.timestamp() * 1000)
 
     frames = []
     for sym in symbols:
-        ohlcv = _safe_fetch_ohlcv(ex, sym, timeframe=timeframe, limit=limit)
+        ohlcv = fetch_ohlcv_since(ex, sym, timeframe, since_ms)
         if not ohlcv:
             print(f"⚠️  Aucune donnée pour {sym} — ignoré.")
             continue
-
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["symbol"] = sym
         frames.append(df)
@@ -71,138 +113,53 @@ def ensure_training_csv() -> None:
     out.to_csv(CSV_PATH, index=False)
     print(f"✅ Données créées : {CSV_PATH.resolve()} (rows={len(out)})")
 
-
-# ----------------- features & dataset -----------------
-def _build_features_common(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
-    """
-    Construit EXACTEMENT les mêmes features que predict.py attend.
-    Retourne (X, df_full_aligne).
-    """
-    df = df.copy()
-
-    # ret_1
-    df["ret_1"] = df["close"].pct_change()
-
-    # rolling mean/std
-    df["roll_mean"] = df["close"].rolling(vol_window).mean()
-    df["roll_std"]  = df["close"].rolling(vol_window).std()
-
-    # RSI(14) simple
-    delta = df["close"].diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=df.index).rolling(14).mean()
-    roll_down = pd.Series(down, index=df.index).rolling(14).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    # high/low range relatif
-    df["hl_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
-
-    # z-score du prix
-    df["price_z"] = (df["close"] - df["roll_mean"]) / (df["roll_std"].replace(0, np.nan))
-
-    # dropna et ordre des colonnes
-    df = df.dropna().copy()
-    feats = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
-    X = df[feats].copy()
-    return X, df
-
-def _make_xy_for_training(df_symbol: pd.DataFrame, vol_window: int):
-    """
-    Construit X, y pour l'entraînement à partir d'un df OHLCV d'un symbole.
-    Cible = direction du prochain close (retour futur).
-    """
-    X, df_feat = _build_features_common(df_symbol, vol_window)
-    # y = +1 si close(t+1) >= close(t), sinon 0
-    future_ret = df_feat["close"].pct_change().shift(-1)
-    y = (future_ret >= 0).astype(int)
-
-    # aligner X et y (on perd la dernière ligne car shift(-1))
-    X = X.iloc[:-1, :].copy()
-    y = y.iloc[:-1].copy()
-
-    # sécurité en cas de classe unique
-    if y.nunique() < 2:
-        # force un minime bruit pour éviter les erreurs (peu probable sur 4h 1500 bars)
-        y.iloc[-1] = 1 - y.iloc[-1]
-
-    return X.values, y.values
-
-
-# ----------------- entraînement -----------------
+# ---------- entraînement avec TSS(5) + sauvegarde ----------
 def train_models():
     df_all = pd.read_csv(CSV_PATH)
-    print(f"📦 training_data.csv lu : {len(df_all)} lignes, {df_all['symbol'].nunique()} symboles.")
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    rows_report = []
-    symbols = sorted(df_all["symbol"].unique())
-
-    for symbol in symbols:
-        df_sym = df_all[df_all["symbol"] == symbol].copy()
-        if len(df_sym) < 300:  # garde-fou
-            print(f"⚠️  Pas assez de données pour {symbol} — skip.")
+    report = []
+    for sym in sorted(df_all["symbol"].unique()):
+        df = df_all[df_all["symbol"] == sym].copy()
+        # build features / target
+        X, y, df_feat = build_features(df, settings.vol_window)
+        if len(df_feat) < 200:
+            print(f"⚠️  {sym}: pas assez de points après features — skip.")
             continue
 
-        # X, y
-        X, y = _make_xy_for_training(df_sym, settings.vol_window)
+        tss = TimeSeriesSplit(n_splits=5)
+        accs, f1s = [], []
+        for tr_idx, te_idx in tss.split(X):
+            Xtr, Xte = X[tr_idx], X[te_idx]
+            ytr, yte = y[tr_idx], y[te_idx]
+            clf = RandomForestClassifier(
+                n_estimators=300, max_depth=None, min_samples_leaf=2, random_state=42, n_jobs=-1
+            )
+            clf.fit(Xtr, ytr)
+            yhat = clf.predict(Xte)
+            accs.append(accuracy_score(yte, yhat))
+            f1s.append(f1_score(yte, yhat))
 
-        # split chronologique 80/20
-        n = len(X)
-        split = int(n * 0.8)
-        X_tr, y_tr = X[:split], y[:split]
-        X_te, y_te = X[split:], y[split:]
+        acc_cv, f1_cv = float(np.mean(accs)), float(np.mean(f1s))
+        print(f"📊 {sym} | acc_cv={acc_cv:.3f} | f1_cv={f1_cv:.3f} | n={len(df_feat)}")
 
-        # pipeline : scaler + random forest
-        pipe = Pipeline(steps=[
-            ("scaler", StandardScaler(with_mean=True, with_std=True)),
-            ("rf", RandomForestClassifier(
-                n_estimators=300,
-                max_depth=None,
-                min_samples_leaf=3,
-                class_weight="balanced",
-                random_state=42,
-                n_jobs=-1,
-            )),
-        ])
+        # modèle final sur tout l'historique
+        final_clf = RandomForestClassifier(
+            n_estimators=500, max_depth=None, min_samples_leaf=2, random_state=42, n_jobs=-1
+        )
+        final_clf.fit(X, y)
+        path = MODELS_DIR / f"{sym.replace('/','_')}_model.pkl"
+        joblib.dump(final_clf, path)
+        print(f"✅ Modèle sauvegardé : {path}")
 
-        pipe.fit(X_tr, y_tr)
+        report.append({"symbol": sym, "n_samples": len(df_feat), "acc_cv": acc_cv, "f1_cv": f1_cv})
 
-        # métriques simples
-        y_hat = pipe.predict(X_te)
-        acc = float(accuracy_score(y_te, y_hat))
-        try:
-            proba = pipe.predict_proba(X_te)[:, 1]
-            auc = float(roc_auc_score(y_te, proba))
-        except Exception:
-            auc = float("nan")
-
-        # sauvegarde modèle
-        model_path = MODELS_DIR / f"{symbol.replace('/','_')}_model.pkl"
-        joblib.dump(pipe, model_path)
-        print(f"✅ Modèle sauvegardé : {model_path} | test_acc={acc:.3f} | roc_auc={auc if auc==auc else 'nan'}")
-
-        rows_report.append({
-            "symbol": symbol,
-            "n_samples": n,
-            "train_size": split,
-            "test_size": n - split,
-            "test_acc": round(acc, 4),
-            "test_roc_auc": (round(auc, 4) if auc == auc else None),  # nan-safe
-        })
-
-    # petit rapport
-    rep = pd.DataFrame(rows_report)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    rep.to_csv(DATA_DIR / "ml_training_report.csv", index=False, encoding="utf-8")
-    print("✅ Entraînement terminé — rapport écrit dans data/ml_training_report.csv")
-
+    pd.DataFrame(report).to_csv(DATA_DIR / "ml_training_report.csv", index=False)
+    print("✅ Entraînement terminé.")
 
 def main():
-    ensure_training_csv()
+    ensure_training_csv_years(years=4)  # ~4 ans
     train_models()
-
 
 if __name__ == "__main__":
     main()
