@@ -5,7 +5,7 @@ pyarrow==17.0.0
 ta==0.11.0
 vectorbt==0.28.1
 
-# Pydantic v2 (pip choisira la bonne version de pydantic-core automatiquement)
+# Pydantic v2
 pydantic==2.8.2
 
 python-dotenv==1.0.1
@@ -16,3 +16,4 @@ matplotlib==3.9.2
 
 joblib==1.4.2
 requests==2.32.3
+scikit-learn==1.4.2   # 🔥 Ajout obligatoire
