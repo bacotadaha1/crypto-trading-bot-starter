@@ -1,15 +1,16 @@
+# src/train.py
 import time
 from pathlib import Path
 import pandas as pd
-import joblib   # <-- AJOUT
-from sklearn.linear_model import LinearRegression  # <-- AJOUT pour un modèle simple
+import joblib
+from sklearn.dummy import DummyClassifier  # exemple simple, remplace par ton vrai modèle
 
 from src.config import settings
 from src.ingestion import make_client
 
 DATA_DIR = settings.data_dir
 CSV_PATH = DATA_DIR / "training_data.csv"
-
+MODELS_DIR = Path("models")
 
 def _parse_symbols() -> list[str]:
     if isinstance(settings.symbols, (list, tuple)):
@@ -17,7 +18,6 @@ def _parse_symbols() -> list[str]:
     if isinstance(settings.symbols, str):
         return [s.strip() for s in settings.symbols.split(",") if s.strip()]
     return ["BTC/USDT"]
-
 
 def _safe_fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int, retries: int = 4, backoff: float = 2.0):
     for i in range(retries):
@@ -28,15 +28,10 @@ def _safe_fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int, retries: int 
                 raise
             time.sleep(backoff * (i + 1))
 
-
 def ensure_training_csv() -> None:
-    """
-    Si data/training_data.csv n'existe pas, on le génère depuis l'exchange.
-    """
     if CSV_PATH.exists():
         print(f"✅ {CSV_PATH} existe déjà — on continue.")
         return
-
     print("⚠️  training_data.csv introuvable — génération automatique depuis l'exchange...")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -51,7 +46,6 @@ def ensure_training_csv() -> None:
         if not ohlcv:
             print(f"⚠️  Aucune donnée pour {sym} — ignoré.")
             continue
-
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["symbol"] = sym
         frames.append(df)
@@ -63,48 +57,39 @@ def ensure_training_csv() -> None:
     out.to_csv(CSV_PATH, index=False)
     print(f"✅ Données créées : {CSV_PATH.resolve()} (rows={len(out)})")
 
-
-# ====== ta logique d’entraînement existante ======
-# Si tu as déjà un code d'entraînement dans un autre module (ex: src.ml_dataset / src.train_model),
-# appelle-le ici. À défaut, on fait un stub minimal.
-
 def train_models():
-    """
-    Exemple simple : pour chaque symbole, on entraîne une régression linéaire
-    close(t-1) -> close(t) et on sauvegarde un modèle dans ./models/
-    """
+    """Entraînement minimal : pour chaque symbole on crée un DummyClassifier et on le sauve.
+       Remplace la logique par ton vrai training."""
     df = pd.read_csv(CSV_PATH)
     print(f"📦 training_data.csv lu : {len(df)} lignes, {df['symbol'].nunique()} symboles.")
-
-    # Créer le dossier models/ si absent
-    MODELS_DIR = Path("models")
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    for sym, grp in df.groupby("symbol"):
-        grp = grp.sort_values("timestamp").reset_index(drop=True)
-        grp["close_lag1"] = grp["close"].shift(1)
-        grp = grp.dropna().reset_index(drop=True)
-
-        if len(grp) < 50:
-            print(f"⚠️ Trop peu de données pour {sym}, on saute.")
+    # pour chaque symbol, exemple : save un dummy (tu mettras ton pipeline scikit)
+    symbols = sorted(df["symbol"].unique())
+    for symbol in symbols:
+        df_sym = df[df["symbol"] == symbol].copy()
+        # exemple features triviales pour démonstration:
+        X = df_sym[["close", "volume"]].fillna(0).values
+        # target bidon: up/down suivant close change
+        y = (df_sym["close"].pct_change().fillna(0) > 0).astype(int).values
+        if len(X) < 2:
+            print(f"⚠️ pas assez de données pour {symbol} — skip.")
             continue
-
-        X = grp[["close_lag1"]].values
-        y = grp["close"].values
-
-        model = LinearRegression()
+        model = DummyClassifier(strategy="most_frequent")
         model.fit(X, y)
-
-        model_path = MODELS_DIR / f"{sym.replace('/', '_')}_model.pkl"
+        model_path = MODELS_DIR / f"{symbol.replace('/','_')}_model.pkl"
         joblib.dump(model, model_path)
         print(f"✅ Modèle sauvegardé : {model_path}")
 
-
+    (DATA_DIR / "ml_training_report.csv").write_text(
+        f"rows,{len(df)}\nsymbols,{','.join(symbols)}\n",
+        encoding="utf-8"
+    )
+    print("✅ Entraînement terminé (rapport écrit).")
 
 def main():
     ensure_training_csv()
     train_models()
-
 
 if __name__ == "__main__":
     main()
