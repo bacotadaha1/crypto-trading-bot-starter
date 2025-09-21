@@ -2,12 +2,11 @@ name: Daily Retrain Models
 
 on:
   schedule:
-    - cron: "30 5 * * *"   # Tous les jours à 05:30 UTC (change si besoin)
+    - cron: "30 05 * * *" # 05:30 UTC
   workflow_dispatch: {}
 
-# IMPORTANT: les permissions doivent être au niveau racine (pas sous "on:")
 permissions:
-  contents: write
+  contents: read   # pas de push de .pkl dans le repo
 
 jobs:
   retrain:
@@ -26,48 +25,31 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # (facultatif) modules explicitement utiles
-          pip install joblib requests
 
-      # (facultatif) Afficher les settings pour debug rapide
-      - name: Debug settings
+      - name: Debug settings (echo)
         run: |
-          python - << 'PY'
-          import os
-          keys = ["EXCHANGE","SYMBOLS","TIMEFRAME","LIMIT","DATA_DIR"]
-          for k in keys:
-              print(k, "=", os.getenv(k))
-          PY
+          echo "EXCHANGE=${{ vars.EXCHANGE || 'kucoin' }}"
+          echo "SYMBOLS=${{ vars.SYMBOLS || 'BTC/USDT,ETH/USDT,SOL/USDT' }}"
+          echo "TIMEFRAME=${{ vars.TIMEFRAME || '4h' }}"
+          echo "LIMIT=${{ vars.LIMIT || '5000' }}"
 
       - name: Fetch OHLCV & train models
         env:
-          # --- Ajuste ici si tu veux overrider .env ---
-          EXCHANGE: kucoin
-          SYMBOLS: BTC/USDT,ETH/USDT,SOL/USDT
-          TIMEFRAME: 4h
-          LIMIT: "1500"      # 1500 bougies ~ historique moyen ; mets 2000/5000 si tu veux plus
+          # Tu peux aussi mettre ces valeurs dans Variables du repo (Actions > Variables)
+          EXCHANGE: ${{ vars.EXCHANGE || 'kucoin' }}
+          SYMBOLS: ${{ vars.SYMBOLS || 'BTC/USDT,ETH/USDT,SOL/USDT' }}
+          TIMEFRAME: ${{ vars.TIMEFRAME || '4h' }}
+          LIMIT: ${{ vars.LIMIT || '5000' }}
           DATA_DIR: ./data
         run: |
-          # src/train.py: main() -> crée le CSV si manquant + entraîne + sauvegarde les .pkl dans models/
           python -m src.train
 
-      - name: Commit updated models & report
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@github.com"
-          git add models/* || true
-          git add data/ml_training_report.csv || true
-          git commit -m "Update trained models (CI)" || echo "Nothing to commit"
-          git push
-
-      - name: Upload training artifacts
+      # IMPORTANT : on ne push rien, on publie les modèles en artifact
+      - name: Upload trained models
         uses: actions/upload-artifact@v4
         with:
-          name: training-artifacts
+          name: trained-models
           path: |
-            data/training_data.csv
-            data/ml_training_report.csv
             models/
-          if-no-files-found: warn
+            data/ml_training_report.csv
+          if-no-files-found: error
