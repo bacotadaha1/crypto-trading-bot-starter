@@ -2,10 +2,10 @@ name: Daily Retrain Models
 
 on:
   schedule:
-    - cron: "30 5 * * *"     # 05:30 UTC (avant la prédiction)
+    - cron: "30 5 * * *"   # Tous les jours à 05:30 UTC (change si besoin)
   workflow_dispatch: {}
 
-# ✅ doit être au niveau racine (pas sous "on:")
+# IMPORTANT: les permissions doivent être au niveau racine (pas sous "on:")
 permissions:
   contents: write
 
@@ -13,19 +13,9 @@ jobs:
   retrain:
     runs-on: ubuntu-latest
 
-    # ✅ lis les valeurs depuis Secrets/Variables (pas en dur)
-    env:
-      EXCHANGE: ${{ secrets.EXCHANGE || vars.EXCHANGE }}   # ex: kucoin
-      SYMBOLS:  ${{ secrets.SYMBOLS  || vars.SYMBOLS  }}   # ex: BTC/USDT,ETH/USDT,SOL/USDT
-      TIMEFRAME: ${{ secrets.TIMEFRAME || vars.TIMEFRAME }} # ex: 4h
-      LIMIT:    ${{ secrets.LIMIT    || vars.LIMIT    }}   # ex: 1500
-      DATA_DIR: ./data
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # ✅ nécessaire pour pouvoir commit/push
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -36,31 +26,40 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # (facultatif) modules explicitement utiles
+          pip install joblib requests
 
-      # (facultatif) petit debug pour vérifier l'exchange pris en compte
+      # (facultatif) Afficher les settings pour debug rapide
       - name: Debug settings
         run: |
-          python - <<'PY'
-          from src.config import settings
-          print("settings.exchange =", settings.exchange)
-          print("symbols =", settings.symbols)
-          print("timeframe =", settings.timeframe, "limit =", settings.limit)
+          python - << 'PY'
+          import os
+          keys = ["EXCHANGE","SYMBOLS","TIMEFRAME","LIMIT","DATA_DIR"]
+          for k in keys:
+              print(k, "=", os.getenv(k))
           PY
 
       - name: Fetch OHLCV & train models
+        env:
+          # --- Ajuste ici si tu veux overrider .env ---
+          EXCHANGE: kucoin
+          SYMBOLS: BTC/USDT,ETH/USDT,SOL/USDT
+          TIMEFRAME: 4h
+          LIMIT: "1500"      # 1500 bougies ~ historique moyen ; mets 2000/5000 si tu veux plus
+          DATA_DIR: ./data
         run: |
-          python -c "from src.train import ensure_training_csv; ensure_training_csv()"
+          # src/train.py: main() -> crée le CSV si manquant + entraîne + sauvegarde les .pkl dans models/
           python -m src.train
 
       - name: Commit updated models & report
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config --global user.name  "github-actions"
+          git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
-          git add models/*.pkl || true
+          git add models/* || true
           git add data/ml_training_report.csv || true
-          git commit -m "Update trained models" || echo "Nothing to commit"
+          git commit -m "Update trained models (CI)" || echo "Nothing to commit"
           git push
 
       - name: Upload training artifacts
