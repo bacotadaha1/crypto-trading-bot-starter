@@ -1,21 +1,21 @@
-﻿from __future__ import annotations
-import os
+from __future__ import annotations
 import math
 import json
 from pathlib import Path
 from datetime import datetime, timezone
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import joblib
 
 from src.config import settings
-from src.ingestion import make_client  # on réutilise ton client CCXT
+from src.ingestion import make_client  # client CCXT
 
 # -------- small helpers --------
 def _sym_to_fname(symbol: str) -> str:
     return symbol.replace("/", "_")
 
-def _build_features(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
+def _build_features(df: pd.DataFrame, vol_window: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Features simples et robustes, cohérentes avec l'entraînement quick-start :
     - returns 1 step
@@ -27,6 +27,7 @@ def _build_features(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
     df["ret_1"] = df["close"].pct_change()
     df["roll_mean"] = df["close"].rolling(vol_window).mean()
     df["roll_std"]  = df["close"].rolling(vol_window).std()
+
     # RSI très simple
     delta = df["close"].diff()
     up = np.where(delta > 0, delta, 0.0)
@@ -35,6 +36,7 @@ def _build_features(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
     roll_down = pd.Series(down, index=df.index).rolling(14).mean()
     rs = roll_up / (roll_down.replace(0, np.nan))
     df["rsi"] = 100 - (100 / (1 + rs))
+
     # shape features
     df["hl_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
 
@@ -43,7 +45,7 @@ def _build_features(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
 
     # drop na
     df = df.dropna().copy()
-    # order columns
+
     feats = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
     dfX = df[feats].copy()
     return dfX, df
@@ -70,21 +72,23 @@ def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
-def load_model_for(symbol: str):
+def load_model_for(symbol: str) -> tuple[object, Path]:
     """
-    Charge le modèle sauvegardé pour un symbole (ex: models/BTC_USDT_model.pkl).
+    Charge le modèle sauvegardé pour un symbole et retourne (model, path).
+    Ex: models/BTC_USDT_model.pkl
     """
     path = Path("models") / f"{symbol.replace('/', '_')}_model.pkl"
     if not path.exists():
         raise FileNotFoundError(f"Aucun modèle trouvé pour {symbol} dans ./models/")
-    return joblib.load(path)
+    model = joblib.load(path)
+    return model, path
 
 def predict_one_symbol(ex, symbol: str) -> dict:
     df = fetch_ohlcv_df(ex, symbol, settings.timeframe, settings.limit)
     X, df_full = _build_features(df, settings.vol_window)
 
-    model = load_model_for(symbol)
- 
+    model, model_path = load_model_for(symbol)
+
     # on prend la dernière ligne de features
     x_last = X.iloc[-1:].copy()
 
@@ -93,13 +97,12 @@ def predict_one_symbol(ex, symbol: str) -> dict:
     y_hat = None
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(x_last.values)
-        # suppose colonne 1 = proba « up »
-        proba_up = float(proba[0, -1])
+        proba_up = float(proba[0, -1])   # suppose dernière colonne = « up »
         y_hat = int(proba_up >= 0.5)
     else:
-        # 2) sinon, régression : on interprète signe comme direction
+        # 2) sinon, régression : on interprète le signe comme direction
         y_val = float(model.predict(x_last.values)[0])
-        proba_up = 1.0/(1.0 + math.exp(-10*y_val))  # squash pour pseudo-proba
+        proba_up = 1.0 / (1.0 + math.exp(-10 * y_val))  # squash pour pseudo-proba
         y_hat = int(y_val >= 0)
 
     last_close = float(df_full["close"].iloc[-1])
@@ -110,7 +113,7 @@ def predict_one_symbol(ex, symbol: str) -> dict:
         "time": tstamp,
         "last_close": last_close,
         "p_up": proba_up,
-        "direction": "UP" if y_hat==1 else "DOWN",
+        "direction": "UP" if y_hat == 1 else "DOWN",
         "model_path": str(model_path),
     }
 
@@ -125,14 +128,20 @@ def main():
             results.append({"symbol": symbol, "error": str(e)})
 
     # message Telegram
-    lines = ["Signal quotidien (ML)", f"Exchange: {settings.exchange}  testnet: {settings.use_testnet}",
-             f"Timeframe: {settings.timeframe}", ""]
+    lines = [
+        "Signal quotidien (ML)",
+        f"Exchange: {settings.exchange}  testnet: {settings.use_testnet}",
+        f"Timeframe: {settings.timeframe}",
+        "",
+    ]
     for r in results:
         if "error" in r:
             lines.append(f"• {r['symbol']} → ERREUR: {r['error']}")
             continue
-        conf = int(round(r["p_up"]*100))
-        lines.append(f"• {r['symbol']} @ {r['time']}  \n  Direction: {r['direction']}  | Confiance: {conf}%  | Close: {r['last_close']}")
+        conf = int(round(r["p_up"] * 100))
+        lines.append(
+            f"• {r['symbol']} @ {r['time']}  \n  Direction: {r['direction']}  | Confiance: {conf}%  | Close: {r['last_close']}"
+        )
 
     msg = "\n".join(lines)
     print(msg)
@@ -140,7 +149,7 @@ def main():
 
     # log JSON si besoin
     Path("data").mkdir(parents=True, exist_ok=True)
-    out = Path("data")/f"predictions_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
+    out = Path("data") / f"predictions_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
     with out.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
