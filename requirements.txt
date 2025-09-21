@@ -16,4 +16,4 @@ matplotlib==3.9.2
 
 joblib==1.4.2
 requests==2.32.3
-scikit-learn==1.4.2   # 🔥 Ajout obligatoire
+scikit-learn==1.5.2   # 🔥 Ajout obligatoire
