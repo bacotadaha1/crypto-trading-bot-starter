@@ -1,8 +1,9 @@
-﻿.env
+.env
 .venv/
-_pycache_/
+__pycache__/
 data/
 *.log
-# --- garder les modèles entraînés dans le repo ---
-!models/
-!models/*.pkl
+
+# on ignore tous les modèles (ils sont stockés en artifacts, pas dans le repo)
+models/
+!models/.gitkeep
