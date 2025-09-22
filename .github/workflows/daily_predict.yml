@@ -2,11 +2,11 @@ name: Daily Predict (Telegram)
 
 on:
   schedule:
-    - cron: "00 06 * * *" # 06:00 UTC, après le retrain
+    - cron: "00 06 * * *"   # 06:00 UTC, après le retrain
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write   # <— on doit avoir 'write' pour pousser preds_log.csv
 
 jobs:
   predict:
@@ -26,8 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Télécharge le DERNIER artifact "trained-models" du workflow de retrain
-      # (cette action va chercher dans le dernier run "success" du fichier daily_retrain.yml)
+      # Récupère le dernier artifact de modèles entraînés (depuis daily_retrain.yml)
       - name: Download trained models artifact
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -51,3 +50,26 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -m src.predict
+
+      # >>> NOUVEAU : on versionne le journal des prédictions <<<
+      - name: Commit & push preds_log.csv
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          # s'assure que le dossier existe
+          mkdir -p data
+          # ajoute seulement le journal
+          git add data/preds_log.csv || true
+          git commit -m "Append daily prediction to preds_log.csv" || echo "Nothing to commit"
+          git push
+
+      # (optionnel) on garde aussi le log en artifact pour debug
+      - name: Upload preds log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preds-log
+          path: data/preds_log.csv
+          if-no-files-found: warn
