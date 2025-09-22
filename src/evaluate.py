@@ -1,42 +1,18 @@
 # src/evaluate.py
 from __future__ import annotations
 
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-import math
 import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
 from src.config import settings
 from src.ingestion import make_client
 
 
-LOG_PATH = Path("data") / "preds_log.csv"
-TIMEFMT_LOG = "%Y-%m-%d %H:%M:%S"   # format ts_utc dans preds_log.csv
-TIMEFMT_BAR = "%Y-%m-%d %H:%M UTC"  # format "time" de predict.py (si besoin)
-
-
-# ----------------------- utils temps & marché -----------------------
-def _timeframe_to_ms(tf: str) -> int:
-    unit = tf[-1]
-    n = int(tf[:-1])
-    if unit == "m":
-        return n * 60_000
-    if unit == "h":
-        return n * 60 * 60_000
-    if unit == "d":
-        return n * 24 * 60 * 60_000
-    raise ValueError(f"timeframe inconnu: {tf}")
-
-def _parse_utc(s: str) -> datetime:
-    # ts_utc: "YYYY-mm-dd HH:MM:SS"
-    return datetime.strptime(s, TIMEFMT_LOG).replace(tzinfo=timezone.utc)
-
-
-# ----------------------- telegram ----------------------------------
-def _send_telegram(msg: str):
+def _send_telegram(msg: str) -> None:
     token = getattr(settings, "telegram_bot_token", "") or ""
     chat_id = getattr(settings, "telegram_chat_id", "") or ""
     if not token or not chat_id:
@@ -53,150 +29,137 @@ def _send_telegram(msg: str):
         print("[WARN] Telegram error:", e)
 
 
-# ----------------------- labellisation (vérité) ---------------------
-def _label_missing(ex, df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pour toutes les lignes sans 'actual_dir' ni 'correct',
-    on récupère la bougie suivante et on marque UP/DOWN + correct.
-    """
-    if "actual_dir" not in df.columns:
-        df["actual_dir"] = pd.NA
-    if "correct" not in df.columns:
-        df["correct"] = pd.NA
+def _load_log(path: Path) -> pd.DataFrame | None:
+    if not path.exists() or path.stat().st_size == 0:
+        print("Aucun data/preds_log.csv — rien à évaluer.")
+        return None
+    df = pd.read_csv(path)
+    # normalise les noms de colonnes
+    df.columns = [c.strip().lower() for c in df.columns]
 
-    tf = str(df["timeframe"].iloc[-1] if "timeframe" in df.columns and df["timeframe"].notna().any() else settings.timeframe)
-    tf_ms = _timeframe_to_ms(tf)
+    # harmonise le nom de la colonne 'symbol'
+    if "symbol" not in df.columns:
+        for alt in ("pair", "ticker", "market", "instrument"):
+            if alt in df.columns:
+                df = df.rename(columns={alt: "symbol"})
+                break
+    if "symbol" not in df.columns:
+        print(f"Colonnes disponibles: {list(df.columns)}")
+        raise KeyError(
+            "Le fichier preds_log.csv ne contient pas de colonne 'symbol'. "
+            "Vérifie l’écriture du log dans src/predict.py."
+        )
 
-    # on parcourt uniquement les lignes à compléter
-    mask_missing = df["actual_dir"].isna() & df["symbol"].notna() & df["direction"].notna()
-    idxs = df.index[mask_missing].tolist()
-    if not idxs:
-        return df
+    # parse timestamp
+    if "ts_utc" in df.columns:
+        df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
+    elif "time" in df.columns:
+        df["ts_utc"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    else:
+        df["ts_utc"] = pd.NaT
 
-    for i in idxs:
-        row = df.loc[i]
-        sym = str(row["symbol"]).strip()
-        if not sym:
-            continue
-        try:
-            t0 = _parse_utc(str(row["ts_utc"]))
-        except Exception:
-            # timestamp illisible, skip
-            continue
-
-        since_ms = int(t0.timestamp() * 1000) - tf_ms
-        try:
-            ohlcv = make_client().fetch_ohlcv(sym, timeframe=tf, since=since_ms, limit=5)
-        except Exception as e:
-            # marché indisponible: on laisse vide
-            continue
-
-        if not ohlcv:
-            continue
-
-        closes = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        closes["ts"] = pd.to_datetime(closes["ts"], unit="ms", utc=True)
-
-        # trouver la barre de t0 puis la suivante
-        # on prend la dernière barre <= t0, puis j+1
-        mask_le = closes["ts"] <= t0
-        if not mask_le.any():
-            continue
-        j0 = int(np.where(mask_le.to_numpy())[0].max())
-        j1 = j0 + 1
-        if j1 >= len(closes):
-            # la bougie suivante n'est pas encore dispo
-            continue
-
-        c0 = float(closes.loc[j0, "close"])
-        c1 = float(closes.loc[j1, "close"])
-        actual_dir = "UP" if c1 > c0 else "DOWN"
-        predicted_dir = str(row["direction"]).upper()
-
-        df.at[i, "actual_dir"] = actual_dir
-        df.at[i, "correct"] = (predicted_dir == actual_dir)
-
+    # nettoie les lignes complètement vides
+    df = df.dropna(subset=["symbol", "ts_utc"], how="any")
     return df
 
 
-# ----------------------- métriques ----------------------------------
-def _accuracy(series_bool: pd.Series) -> float | None:
-    if series_bool.empty:
+def _next_close_for(ex, symbol: str, timeframe: str, ref_ts: pd.Timestamp) -> float | None:
+    """
+    Récupère le close de la bougie **suivante** après ref_ts.
+    """
+    limit = 5
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    d = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+    d["ts"] = pd.to_datetime(d["ts"], unit="ms", utc=True)
+    # trouve la première bougie strictement > ref_ts
+    nxt = d[d["ts"] > ref_ts].head(1)
+    if len(nxt) == 0:
         return None
-    return float(series_bool.mean())
+    return float(nxt["close"].iloc[0])
 
-def _fmt_pct(x: float | None) -> str:
-    if x is None or (isinstance(x, float) and (math.isnan(x))):
-        return "—"
-    return f"{int(round(x * 100))}%"
 
-def _compute_metrics(df: pd.DataFrame, days: int = 7):
+def _compute_metrics(df: pd.DataFrame, days: int) -> tuple[str, dict]:
     """
-    Renvoie:
-      - acc_all: accuracy sur toutes les lignes évaluées
-      - acc_ndays: accuracy sur les N derniers jours
-      - by_symbol_ndays: dict {symbol: accuracy sur N jours}
-      - sample_sizes: dict avec tailles d'échantillons
+    Filtre sur les N derniers jours et calcule la précision globale + par symbole.
     """
-    evaluated = df[df["correct"].notna()].copy()
-    acc_all = _accuracy(evaluated["correct"].astype(bool)) if not evaluated.empty else None
+    since = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(days=days)
+    recent = df[df["ts_utc"] >= since].copy()
+    if recent.empty:
+        return f"Aucune prédiction dans les {days} derniers jours.", {}
 
-    # fenêtre glissante N jours
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    recent = evaluated[ evaluated["ts_utc"].apply(lambda s: _parse_utc(str(s)) >= cutoff) ].copy()
-    acc_ndays = _accuracy(recent["correct"].astype(bool)) if not recent.empty else None
-
-    by_symbol_ndays: dict[str, float | None] = {}
-    for sym, grp in recent.groupby("symbol"):
-        by_symbol_ndays[str(sym)] = _accuracy(grp["correct"].astype(bool))
-
-    sample_sizes = {
-        "all": int(len(evaluated)),
-        f"last_{days}d": int(len(recent)),
-    }
-    return acc_all, acc_ndays, by_symbol_ndays, sample_sizes
-
-
-# ----------------------- entrée principale --------------------------
-def main():
-    if not LOG_PATH.exists():
-        print("Aucun data/preds_log.csv — rien à évaluer.")
-        return
-
-    df = pd.read_csv(LOG_PATH)
-    if df.empty:
-        print("preds_log.csv vide.")
-        return
-
-    # 1) compléter les lignes manquantes (vérité terrain)
+    # client exchange une seule fois
     ex = make_client()
-    df = _label_missing(ex, df)
 
-    # 2) sauvegarder le log mis à jour
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(LOG_PATH, index=False)
+    # on s'assure que les champs nécessaires existent
+    for col in ("p_up", "direction", "last_close"):
+        if col not in recent.columns:
+            recent[col] = np.nan
 
-    # 3) calcul des métriques (N jours paramétrable via env ACC_N_DAYS, défaut 7)
-    n_days = int(os.getenv("ACC_N_DAYS", "7"))
-    acc_all, acc_ndays, by_sym, sizes = _compute_metrics(df, days=n_days)
+    results = []
+    for _, row in recent.iterrows():
+        sym = str(row["symbol"])
+        ref_ts = row["ts_utc"]
+        pred_dir = str(row.get("direction", "")).upper()
+        try:
+            last_close = float(row.get("last_close"))
+        except Exception:
+            last_close = np.nan
 
-    # 4) message Telegram
-    lines = []
-    lines.append("*Bilan des prédictions*")
-    lines.append(f"Exchange: `{settings.exchange}`   timeframe: `{settings.timeframe}`")
-    lines.append("")
-    lines.append(f"Accuracy (tout l'historique évalué): *{_fmt_pct(acc_all)}*  (n={sizes['all']})")
-    lines.append(f"Accuracy {n_days}j: *{_fmt_pct(acc_ndays)}*  (n={sizes[f'last_{n_days}d']})")
-    lines.append("")
+        close_next = None
+        ok = None
+        err = None
+        try:
+            close_next = _next_close_for(ex, sym, settings.timeframe, ref_ts)
+            if close_next is not None and not np.isnan(last_close):
+                realized = "UP" if close_next >= last_close else "DOWN"
+                ok = (realized == pred_dir)
+            else:
+                ok = None
+        except Exception as e:
+            err = str(e)
 
+        results.append({
+            "symbol": sym,
+            "ts_utc": ref_ts,
+            "pred_dir": pred_dir,
+            "last_close": last_close,
+            "close_next": close_next,
+            "ok": ok,
+            "error": err,
+        })
+
+    resdf = pd.DataFrame(results)
+
+    # précision globale (ignore None)
+    valid = resdf[resdf["ok"].notna()]
+    global_acc = float(valid["ok"].mean()) if not valid.empty else np.nan
+
+    # précision par symbole
+    by_sym = {}
+    for sym, grp in valid.groupby("symbol"):
+        by_sym[sym] = float(grp["ok"].mean())
+
+    # message
+    lines = [f"*Évaluation sur {days} jour(s)*",
+             f"Précision globale: *{0 if np.isnan(global_acc) else round(global_acc*100):.0f}%*",
+             ""]
     if by_sym:
-        lines.append(f"*Détail par symbole (sur {n_days}j)*")
         for sym, acc in sorted(by_sym.items()):
-            lines.append(f"• {sym}: {_fmt_pct(acc)}")
+            lines.append(f"• {sym}: *{round(acc*100):.0f}%*")
     else:
-        lines.append("_Pas assez de données récentes pour un détail par symbole._")
+        lines.append("_Pas assez de données valides pour calculer une précision._")
 
-    msg = "\n".join(lines)
+    return "\n".join(lines), by_sym
+
+
+def main():
+    days = int(os.getenv("EVAL_DAYS", "7"))
+    log_path = Path("data") / "preds_log.csv"
+    df = _load_log(log_path)
+    if df is None or df.empty:
+        return
+
+    msg, _ = _compute_metrics(df, days)
     print(msg)
     _send_telegram(msg)
 
