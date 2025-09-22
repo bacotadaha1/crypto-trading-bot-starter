@@ -1,9 +1,13 @@
 .env
 .venv/
 __pycache__/
-data/
 *.log
 
-# on ignore tous les modèles (ils sont stockés en artifacts, pas dans le repo)
-models/
+# --- data : ignorer tout, SAUF le journal des prédictions ---
+data/*
+!data/preds_log.csv
+!data/.gitkeep
+
+# --- models : ignorer tous les modèles lourds (stockés en artifacts) ---
+models/*
 !models/.gitkeep
