@@ -1,5 +1,6 @@
 # src/train.py
 from __future__ import annotations
+
 import time
 from pathlib import Path
 from typing import Tuple
@@ -8,8 +9,10 @@ import numpy as np
 import pandas as pd
 import joblib
 
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import SGDClassifier  # compatible online_update (partial_fit)
 
 from src.config import settings
 from src.ingestion import make_client
@@ -20,7 +23,7 @@ CSV_PATH = DATA_DIR / "training_data.csv"
 MODELS_DIR = Path("models")
 
 
-# ---------- utilitaires ----------
+# -------------------- utils --------------------
 def _parse_symbols() -> list[str]:
     if isinstance(settings.symbols, (list, tuple)):
         return [s.strip() for s in settings.symbols if s.strip()]
@@ -41,14 +44,13 @@ def _safe_fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int, retries: int 
 
 def ensure_training_csv() -> None:
     """
-    Crée data/training_data.csv si absent en téléchargeant l'OHLCV.
-    Sauvegarde colonnes: [timestamp(ms), open, high, low, close, volume, symbol]
+    Crée data/training_data.csv si absent en téléchargeant l'OHLCV (tous symboles).
     """
     if CSV_PATH.exists():
         print(f"✅ {CSV_PATH} existe déjà — on continue.")
         return
 
-    print("⚠️  training_data.csv introuvable — génération automatique depuis l'exchange...")
+    print("⚠️  training_data.csv introuvable — génération automatique depuis l'exchange…")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     ex = make_client()
@@ -62,7 +64,6 @@ def ensure_training_csv() -> None:
         if not ohlcv:
             print(f"⚠️  Aucune donnée pour {sym} — ignoré.")
             continue
-
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["symbol"] = sym
         frames.append(df)
@@ -75,78 +76,84 @@ def ensure_training_csv() -> None:
     print(f"✅ Données créées : {CSV_PATH.resolve()} (rows={len(out)})")
 
 
-def _prepare_df_symbol(df_sym: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalise le DataFrame d'un symbole:
-      - crée 'ts' (datetime UTC) à partir de 'timestamp' (ms) si nécessaire
-      - tri + colonnes minimales
-    """
-    df = df_sym.copy()
-    if "ts" not in df.columns:
-        # le CSV a 'timestamp' en millisecondes
-        df["ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.sort_values("ts").reset_index(drop=True)
-    return df[["ts", "open", "high", "low", "close", "volume"]]
+# -------------------- features --------------------
+_BASE_FEATS = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
+_ALT_FEATS  = ["sent_hour", "fg_idx", "rv_w6", "rv_w36", "vol_z"]
+_ALL_FEATS  = _BASE_FEATS + _ALT_FEATS  # 12 features au total
 
-
-def _build_features_train(df_in: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+def _build_tech_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Construit les mêmes features que la prédiction (prix + alt-data) et la cible (UP/DOWN à 1 step).
-    Robuste si alt-data absente : remplissage à 0.0.
+    Construit les features 'techniques' sur le dataframe de prix (une ligne = une bougie).
     """
-    df = df_in.copy()
+    d = df.copy()
+    d["ret_1"] = d["close"].pct_change()
 
-    # ----- prix
-    df["ret_1"] = df["close"].pct_change()
     roll = int(getattr(settings, "vol_window", 12))
-    df["roll_mean"] = df["close"].rolling(roll).mean()
-    df["roll_std"]  = df["close"].rolling(roll).std()
+    d["roll_mean"] = d["close"].rolling(roll).mean()
+    d["roll_std"]  = d["close"].rolling(roll).std()
 
-    delta = df["close"].diff()
+    # RSI (14)
+    delta = d["close"].diff()
     up = np.where(delta > 0, delta, 0.0)
     down = np.where(delta < 0, -delta, 0.0)
-    r_up = pd.Series(up, index=df.index).rolling(14).mean()
-    r_dn = pd.Series(down, index=df.index).rolling(14).mean()
+    r_up = pd.Series(up, index=d.index).rolling(14).mean()
+    r_dn = pd.Series(down, index=d.index).rolling(14).mean()
     rs = r_up / r_dn.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    d["rsi"] = 100 - (100 / (1 + rs))
 
-    df["hl_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
-    df["price_z"] = (df["close"] - df["roll_mean"]) / (df["roll_std"].replace(0, np.nan))
+    d["hl_range"] = (d["high"] - d["low"]) / d["close"].replace(0, np.nan)
+    d["price_z"] = (d["close"] - d["roll_mean"]) / d["roll_std"].replace(0, np.nan)
 
-    # ----- alt-data alignée ts
+    d = d.dropna().copy()
+    return d
+
+
+def _build_dataset_for_symbol(df_sym: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Pour un symbole donné :
+      - fabrique les features techniques
+      - fabrique les alt-features alignées (sentiment RSS, Fear&Greed, régimes)
+      - merge sur 'ts'
+      - crée la cible binaire (UP = 1 si close[t+1] > close[t])
+    Retourne X (12 colonnes) et y.
+    """
+    # rename 'timestamp' -> 'ts' et passer en UTC
+    df = df_sym.rename(columns={"timestamp": "ts"}).copy()
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+
+    # features techniques
+    tech = _build_tech_features(df)
+
+    # alt features alignées sur les timestamps des bougies
     alt = build_alt_features(df[["ts", "close", "volume"]])
-    df = df.set_index("ts").join(alt, how="left").reset_index()
 
-    alt_cols = ["sent_hour", "fg_idx", "rv_w6", "rv_w36", "vol_z"]
-    for col in alt_cols:
-        if col not in df.columns:
-            df[col] = 0.0
-        df[col] = df[col].fillna(0.0)
+    # merge (inner) sur ts
+    merged = (
+        tech.merge(alt, left_on=pd.to_datetime(tech["ts"], utc=True),
+                   right_on=alt.index, how="inner")
+    )
+    # après merge, 'key_0' est l'index alt; on réinstalle 'ts'
+    merged = merged.drop(columns=["key_0"])
+    merged = merged.set_index(pd.to_datetime(merged["ts"], utc=True)).sort_index()
 
-    # cible = signe du retour futur
-    df["future_ret"] = df["close"].pct_change().shift(-1)
-    y = (df["future_ret"] > 0).astype("int8")
+    # cible : direction de la prochaine bougie
+    merged["future_ret"] = merged["close"].pct_change().shift(-1)
+    y = (merged["future_ret"] > 0).astype("int8")
 
-    # drop uniquement sur le noyau "prix" nécessaire
-    core_needed = ["ret_1", "roll_mean", "roll_std", "rsi", "future_ret"]
-    df = df.dropna(subset=core_needed).copy()
+    X = merged[_ALL_FEATS].copy()
 
-    feats = [
-        "ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume",
-        "sent_hour", "fg_idx", "rv_w6", "rv_w36", "vol_z",
-    ]
-    X = df[feats].astype("float32")
-    y = y.loc[X.index].astype("int8")
+    xy = pd.concat([X, y.rename("y")], axis=1).dropna()
+    X = xy[_ALL_FEATS].astype("float32")
+    y = xy["y"].astype("int8")
 
     return X, y
 
 
+# -------------------- train --------------------
 def train_models() -> None:
     """
-    Entraîne un modèle compact par symbole et le sauvegarde compressé (<100MB).
-    - RandomForest limité en profondeur
-    - compression joblib
-    - CV TimeSeriesSplit (log d’info)
+    Entraîne un modèle **SGDClassifier dans un Pipeline(StandardScaler)** pour chaque symbole,
+    sur **12 features** (7 techniques + 5 alt-data). Sauvegarde compressée.
     """
     df_all = pd.read_csv(CSV_PATH)
     print(f"📦 training_data.csv lu : {len(df_all)} lignes, {df_all['symbol'].nunique()} symboles.")
@@ -154,34 +161,37 @@ def train_models() -> None:
 
     symbols = sorted(df_all["symbol"].unique())
     for symbol in symbols:
-        base = _prepare_df_symbol(df_all[df_all["symbol"] == symbol])
-        X, y = _build_features_train(base)
-        if len(X) < 200:
-            print(f"⚠️  Trop peu d'observations pour {symbol} — skip.")
+        df = df_all[df_all["symbol"] == symbol].copy()
+        X, y = _build_dataset_for_symbol(df)
+
+        if len(X) < 300:
+            print(f"⚠️  Trop peu d'observations pour {symbol} — skip ({len(X)}).")
             continue
 
-        model = RandomForestClassifier(
-            n_estimators=120,
-            max_depth=8,
-            min_samples_leaf=5,
-            n_jobs=-1,
-            random_state=42,
-        )
+        # Pipeline compatible avec online_update (partial_fit sur SGD)
+        pipe = Pipeline(steps=[
+            ("scaler", StandardScaler(with_mean=True, with_std=True)),
+            ("clf", SGDClassifier(loss="log_loss",
+                                  alpha=1e-4,
+                                  max_iter=1000,
+                                  tol=1e-3,
+                                  random_state=42))
+        ])
 
-        # (optionnel) CV pour info
-        tscv = TimeSeriesSplit(n_splits=5)
+        # CV en TimeSeriesSplit (facultatif)
         try:
-            scores = cross_val_score(model, X.values, y.values, cv=tscv, scoring="roc_auc", n_jobs=-1)
+            tscv = TimeSeriesSplit(n_splits=5)
+            scores = cross_val_score(pipe, X.values, y.values, cv=tscv,
+                                     scoring="roc_auc", n_jobs=-1)
             print(f"📈 {symbol} | AUC CV (5 folds): {scores.mean():.3f} ± {scores.std():.3f}")
         except Exception as e:
             print(f"[WARN] CV échouée pour {symbol}: {e}")
 
-        model.fit(X.values, y.values)
+        pipe.fit(X.values, y.values)
 
-        # --- sauvegarde compressée ---
         model_path = MODELS_DIR / f"{symbol.replace('/','_')}_model.pkl"
-        joblib.dump(model, model_path, compress=3)
-        print(f"✅ Modèle sauvegardé (compressé) : {model_path}")
+        joblib.dump(pipe, model_path, compress=3)
+        print(f"✅ Modèle sauvegardé (12 feats, compressé) : {model_path}")
 
     # petit rapport
     (DATA_DIR / "ml_training_report.csv").write_text(
