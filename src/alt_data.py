@@ -1,35 +1,44 @@
 # src/alt_data.py
 from __future__ import annotations
+from datetime import timezone
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
 import math
 
 import pandas as pd
 import numpy as np
 import requests
-import feedparser
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# --- Imports optionnels : si absents, on les met à None pour fallback propre ---
+try:
+    import feedparser
+except Exception:
+    feedparser = None
+
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+except Exception:
+    SentimentIntensityAnalyzer = None
 
 
 # ---------- helpers temps ----------
 def _to_utc(ts: pd.Series | pd.DatetimeIndex) -> pd.DatetimeIndex:
     dt = pd.to_datetime(ts, utc=True, errors="coerce")
-    # drop tz-naive if any
-    if isinstance(dt, pd.Series):
-        return pd.DatetimeIndex(dt)
-    return dt
+    return pd.DatetimeIndex(dt)
 
-def _resample_to_index(src: pd.Series | pd.DataFrame, target_index: pd.DatetimeIndex, method: str = "ffill"):
+
+def _resample_to_index(
+    src: pd.Series | pd.DataFrame,
+    target_index: pd.DatetimeIndex,
+    method: str = "ffill",
+):
     """
     Réindexe une série/dataframe (horaires arbitraires) sur l'index cible (tes bougies),
     en forward-fill pour coller au dernier signal connu.
     """
     if isinstance(src, pd.Series):
-        s = src.sort_index()
-        return s.reindex(target_index, method=method)
+        return src.sort_index().reindex(target_index, method=method)
     else:
-        df = src.sort_index()
-        return df.reindex(target_index, method=method)
+        return src.sort_index().reindex(target_index, method=method)
 
 
 # ---------- Fear & Greed (daily) ----------
@@ -45,7 +54,6 @@ def fetch_fear_greed(days: int = 90) -> pd.Series:
         data = r.json().get("data", [])
         rows = []
         for it in data:
-            # timestamp (s) -> date UTC
             ts = pd.to_datetime(int(it["timestamp"]), unit="s", utc=True).normalize()
             val = float(it["value"])
             rows.append((ts, val))
@@ -59,7 +67,7 @@ def fetch_fear_greed(days: int = 90) -> pd.Series:
 
 
 # ---------- Sentiment RSS (hourly) ----------
-_ANALYZER = SentimentIntensityAnalyzer()
+_ANALYZER = SentimentIntensityAnalyzer() if SentimentIntensityAnalyzer else None
 _DEFAULT_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
@@ -67,17 +75,25 @@ _DEFAULT_FEEDS = [
     "https://www.reddit.com/r/CryptoCurrency/.rss",
 ]
 
+
 def _score_text(text: str) -> float:
+    if _ANALYZER is None:
+        return 0.0
     try:
         return float(_ANALYZER.polarity_scores(text or "")["compound"])
     except Exception:
         return 0.0
 
+
 def fetch_rss_sentiment(hours: int = 48, feeds: list[str] | None = None) -> pd.Series:
     """
     Télécharge quelques flux RSS publics et agrège un score VADER horaire (moyenne).
-    Fallback silencieux -> série vide si erreur / pas d’articles.
+    Fallback silencieux -> série vide si erreur / pas d’articles / libs manquantes.
     """
+    # Si une des dépendances n'est pas dispo, on désactive proprement
+    if feedparser is None or _ANALYZER is None:
+        return pd.Series(dtype="float64")
+
     feeds = feeds or _DEFAULT_FEEDS
     cutoff = pd.Timestamp.now(tz=timezone.utc) - pd.Timedelta(hours=hours)
     buckets: dict[pd.Timestamp, list[float]] = {}
@@ -85,15 +101,12 @@ def fetch_rss_sentiment(hours: int = 48, feeds: list[str] | None = None) -> pd.S
         for url in feeds:
             parsed = feedparser.parse(url)
             for e in parsed.get("entries", []):
-                # timestamp de l'article (si absent -> ignore)
                 dt = None
                 for key in ("published_parsed", "updated_parsed"):
                     if e.get(key):
                         dt = pd.to_datetime(e[key], utc=True)
                         break
-                if dt is None:
-                    continue
-                if dt < cutoff:
+                if dt is None or dt < cutoff:
                     continue
                 title = e.get("title", "")
                 summ = e.get("summary", "")
@@ -102,7 +115,6 @@ def fetch_rss_sentiment(hours: int = 48, feeds: list[str] | None = None) -> pd.S
                 buckets.setdefault(hour, []).append(score)
         if not buckets:
             return pd.Series(dtype="float64")
-        # moyenne par heure
         s = pd.Series({k: float(np.nanmean(v)) for k, v in buckets.items()}).sort_index()
         s.name = "sent_hour"
         return s
@@ -143,7 +155,7 @@ def build_alt_features(df_price: pd.DataFrame) -> pd.DataFrame:
     ts = _to_utc(df_price["ts"])
     target_index = pd.DatetimeIndex(pd.Series(ts)).sort_values()
 
-    # alt: sentiment houre + fear/greed
+    # alt: sentiment horaire + fear/greed
     s_sent = fetch_rss_sentiment(hours=72)
     s_fg = fetch_fear_greed(days=90)
 
@@ -154,7 +166,6 @@ def build_alt_features(df_price: pd.DataFrame) -> pd.DataFrame:
         s_sent = pd.Series(index=target_index, dtype="float64", name="sent_hour")
 
     if not s_fg.empty:
-        # daily -> ffill sur heures
         s_fg = _resample_to_index(s_fg, target_index, method="ffill")
     else:
         s_fg = pd.Series(index=target_index, dtype="float64", name="fg_idx")
