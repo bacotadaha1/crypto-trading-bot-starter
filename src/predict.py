@@ -10,58 +10,18 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import joblib
+from pandas.api.types import is_datetime64_any_dtype
 
 from src.config import settings
 from src.ingestion import make_client
-from src.alt_data import build_alt_features  # OK même si alt sera ignoré si non utilisé
+from src.alt_data import build_alt_features  # <- alt-data (sentiment, fear&greed, regime)
 
-# --- constantes ---
+# ------------------------- utils -------------------------
+
 CORE_FEATS = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
-
-# ------------------------- helpers -------------------------
 
 def _sym_to_fname(symbol: str) -> str:
     return symbol.replace("/", "_").replace("-", "_").upper()
-
-def _build_core_features(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
-    df = df.copy()
-    df["ret_1"] = df["close"].pct_change()
-    df["roll_mean"] = df["close"].rolling(vol_window).mean()
-    df["roll_std"] = df["close"].rolling(vol_window).std()
-    # RSI 14 simple
-    delta = df["close"].diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=df.index).rolling(14).mean()
-    roll_down = pd.Series(down, index=df.index).rolling(14).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    df["rsi"] = 100 - (100 / (1 + rs))
-    # formes & normalisation
-    df["hl_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
-    df["price_z"] = (df["close"] - df["roll_mean"]) / (df["roll_std"].replace(0, np.nan))
-    return df
-
-def _build_full_feature_table(df_price: pd.DataFrame, vol_window: int) -> pd.DataFrame:
-    """
-    Construit un tableau de features avec index ts, contenant
-    - les 7 features cœur (toujours)
-    - + les alt-features (si disponibles)
-    """
-    core = _build_core_features(df_price, vol_window).copy()
-    core["ts"] = pd.to_datetime(core["ts"], unit="ms", utc=True) if np.issubdtype(core["ts"].dtype, np.number) else pd.to_datetime(core["ts"], utc=True)
-    core = core.dropna().copy()
-    core_idxed = core.set_index("ts").sort_index()
-
-    # alt-data (sentiment, fear & greed, régimes)
-    try:
-        alt = build_alt_features(df_price)
-        # concat sur l'index (ts)
-        feat_all = pd.concat([core_idxed[CORE_FEATS], alt], axis=1)
-    except Exception:
-        # si l’alt-data échoue, on reste sur les 7 features cœur
-        feat_all = core_idxed[CORE_FEATS].copy()
-
-    return feat_all
 
 def _send_telegram(msg: str) -> None:
     token = getattr(settings, "telegram_bot_token", "") or ""
@@ -82,53 +42,103 @@ def _send_telegram(msg: str) -> None:
 def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+    # ts en datetime UTC
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
+
+# ------------------------- features -------------------------
+
+def _build_core_features(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
+    """
+    Construit les 7 features "core" alignées au training.
+    Retourne un DataFrame avec colonnes: ['ts'] + CORE_FEATS
+    """
+    x = df.copy()
+    # sécurité temps
+    if not is_datetime64_any_dtype(x["ts"]):
+        x["ts"] = pd.to_datetime(x["ts"], utc=True)
+
+    x["ret_1"] = x["close"].pct_change()
+    x["roll_mean"] = x["close"].rolling(vol_window).mean()
+    x["roll_std"] = x["close"].rolling(vol_window).std()
+
+    delta = x["close"].diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=x.index).rolling(14).mean()
+    roll_down = pd.Series(down, index=x.index).rolling(14).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    x["rsi"] = 100 - (100 / (1 + rs))
+
+    x["hl_range"] = (x["high"] - x["low"]) / x["close"].replace(0, np.nan)
+    x["price_z"] = (x["close"] - x["roll_mean"]) / (x["roll_std"].replace(0, np.nan))
+
+    x = x.dropna().copy()
+    return x[["ts"] + CORE_FEATS].copy()
+
+def _build_full_feature_table(df_price: pd.DataFrame, vol_window: int) -> pd.DataFrame:
+    """
+    Assemble core (7) + alt-data (sentiment/hourly, fg_idx, regime) alignés sur ts.
+    """
+    core = _build_core_features(df_price, vol_window).copy()
+
+    # normalise ts proprement (évite l'erreur 'datetime64ns, UTC as a data type')
+    if not is_datetime64_any_dtype(core["ts"]):
+        core["ts"] = pd.to_datetime(core["ts"], utc=True)
+
+    core_idxed = core.set_index("ts").sort_index()
+
+    # alt-data alignées sur les mêmes timestamps
+    alt = build_alt_features(df_price)  # index = ts (UTC)
+    # join et ffill pour compléter les trous
+    full = core_idxed.join(alt, how="left").ffill()
+
+    full = full.dropna().copy()
+    full.reset_index(inplace=True)  # remet 'ts' en colonne
+    return full  # colonnes: ['ts'] + CORE_FEATS + alt-cols
+
+# ------------------------- modèle -------------------------
 
 def load_model_for(symbol: str):
     path = Path("models") / f"{_sym_to_fname(symbol)}_model.pkl"
     if not path.exists():
         raise FileNotFoundError(f"Aucun modèle trouvé pour {symbol} dans ./models/")
-    model = joblib.load(path)
-    # essaie de récupérer la liste de features utilisée au train
-    feat_names = None
-    if hasattr(model, "_feat_names") and isinstance(model._feat_names, (list, tuple)):
-        feat_names = list(model._feat_names)
-    elif hasattr(model, "feature_names_in_"):
-        feat_names = list(model.feature_names_in_)
-    return model, path, feat_names
+    return joblib.load(path), path
 
-def _align_features_for_model(X_all: pd.DataFrame, feat_names: list[str] | None) -> pd.DataFrame:
+def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
     """
-    Aligne X_all sur les colonnes attendues par le modèle.
-    - si feat_names est None -> on prend CORE_FEATS (compatibilité anciens modèles)
-    - colonnes manquantes -> remplies à 0.0
-    - colonnes en trop -> ignorées
+    Aligne X sur les features apprises par le modèle:
+      - si feature_names_in_ dispo: on reindex sur ces colonnes (remplissage 0 si manque)
+      - sinon si n_features_in_ dispo: on prend les n premières colonnes de X
+      - sinon: on renvoie X tel quel
     """
-    want = feat_names or CORE_FEATS
-    X = X_all.copy()
-    for c in want:
-        if c not in X.columns:
-            X[c] = 0.0
-    X = X[want].copy()
+    names = getattr(model, "feature_names_in_", None)
+    if names is not None:
+        return X.reindex(columns=list(names), fill_value=0)
+
+    n = getattr(model, "n_features_in_", None)
+    if isinstance(n, (int, np.integer)) and n > 0:
+        # garde l'ordre actuel des colonnes
+        return X.iloc[:, :int(n)]
+
     return X
 
 # ------------------------- prédiction -------------------------
 
 def predict_one_symbol(ex, symbol: str) -> dict:
     df_price = fetch_ohlcv_df(ex, symbol, settings.timeframe, settings.limit)
-    feat_all = _build_full_feature_table(df_price, settings.vol_window)
 
-    model, model_path, feat_names = load_model_for(symbol)
-    X = _align_features_for_model(feat_all, feat_names)
+    # table complète (core + alt)
+    full = _build_full_feature_table(df_price, settings.vol_window)
+    # X = toutes les colonnes sauf 'ts'
+    X_all = full.drop(columns=["ts"])
+    x_last_all = X_all.iloc[-1:].copy()
 
-    # dernière observation
-    X = X.dropna()
-    x_last = X.iloc[-1:].copy()
-    if x_last.empty:
-        raise RuntimeError("Features vides après alignement (trop de NaN).")
+    model, model_path = load_model_for(symbol)
+    # aligne les colonnes avec le modèle
+    x_last = _align_features_to_model(x_last_all, model)
 
-    # classification (predict_proba) ou régression -> pseudo-proba
+    # predict / predict_proba
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(x_last.values)
         p_up = float(proba[0, -1])
@@ -139,7 +149,7 @@ def predict_one_symbol(ex, symbol: str) -> dict:
         direction = "UP" if y_val >= 0 else "DOWN"
 
     last_close = float(df_price["close"].iloc[-1])
-    tstamp = df_price["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
+    tstamp = pd.to_datetime(df_price["ts"].iloc[-1]).strftime("%Y-%m-%d %H:%M UTC")
 
     return {
         "symbol": symbol,
@@ -154,6 +164,7 @@ def predict_one_symbol(ex, symbol: str) -> dict:
 
 def main():
     ex = make_client()
+
     symbols = settings.symbols
     if isinstance(symbols, str):
         symbols = [s.strip() for s in symbols.split(",") if s.strip()]
@@ -170,7 +181,7 @@ def main():
     limit_txt = f"  Limit: {settings.limit}" if hasattr(settings, "limit") else ""
     lines = [
         "*Signal quotidien (ML + Sentiment)*",
-        f"Exchange: `{settings.exchange}`   testnet: `{settings.use_testnet}`",
+        f"Exchange: `kucoin`   testnet: `{settings.use_testnet}`",
         f"Timeframe: `{settings.timeframe}`{limit_txt}",
         ""
     ]
@@ -189,34 +200,47 @@ def main():
     print(msg)
     _send_telegram(msg)
 
-    # log JSON facultatif
+    # logs
     Path("data").mkdir(parents=True, exist_ok=True)
+
     out_json = Path("data") / f"predictions_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    # journal CSV pour évaluation
+    # journal CSV pour l'évaluation
     log_path = Path("data") / "preds_log.csv"
     rows = []
     ts_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     for r in results:
         if "error" in r:
             rows.append({
-                "ts_utc": ts_now, "exchange": settings.exchange, "timeframe": settings.timeframe,
-                "symbol": r.get("symbol"), "last_close": None, "p_up": None, "direction": None, "error": r.get("error"),
+                "ts_utc": ts_now,
+                "exchange": settings.exchange,
+                "timeframe": settings.timeframe,
+                "symbol": r.get("symbol"),
+                "last_close": None,
+                "p_up": None,
+                "direction": None,
+                "error": r.get("error"),
             })
         else:
             rows.append({
-                "ts_utc": ts_now, "exchange": settings.exchange, "timeframe": settings.timeframe,
-                "symbol": r["symbol"], "last_close": r["last_close"], "p_up": r["p_up"], "direction": r["direction"], "error": None,
+                "ts_utc": ts_now,
+                "exchange": settings.exchange,
+                "timeframe": settings.timeframe,
+                "symbol": r["symbol"],
+                "last_close": r["last_close"],
+                "p_up": r["p_up"],
+                "direction": r["direction"],
+                "error": None,
             })
-    if rows:
-        write_header = not log_path.exists()
-        with log_path.open("a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            if write_header:
-                w.writeheader()
-            w.writerows(rows)
+
+    write_header = not log_path.exists()
+    with log_path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        if write_header:
+            w.writeheader()
+        w.writerows(rows)
 
 if __name__ == "__main__":
     main()
