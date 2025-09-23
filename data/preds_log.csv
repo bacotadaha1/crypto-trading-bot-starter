@@ -26,3 +26,6 @@ ts_utc,exchange,timeframe,symbol,last_close,p_up,direction,error
 2025-09-23 22:19:25,kucoin,4h,BTC/USDT,,,,"Cannot interpret 'datetime64[ns, UTC]' as a data type"
 2025-09-23 22:19:25,kucoin,4h,ETH/USDT,,,,"Cannot interpret 'datetime64[ns, UTC]' as a data type"
 2025-09-23 22:19:25,kucoin,4h,SOL/USDT,,,,"Cannot interpret 'datetime64[ns, UTC]' as a data type"
+2025-09-23 22:39:08,kucoin,4h,BTC/USDT,,,,"Found array with 0 sample(s) (shape=(0, 7)) while a minimum of 1 is required by SGDClassifier."
+2025-09-23 22:39:08,kucoin,4h,ETH/USDT,,,,"Found array with 0 sample(s) (shape=(0, 7)) while a minimum of 1 is required by SGDClassifier."
+2025-09-23 22:39:08,kucoin,4h,SOL/USDT,,,,"Found array with 0 sample(s) (shape=(0, 7)) while a minimum of 1 is required by SGDClassifier."
