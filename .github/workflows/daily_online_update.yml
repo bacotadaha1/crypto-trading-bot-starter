@@ -1,0 +1,66 @@
+name: Daily Online Update (incremental learning)
+
+on:
+  schedule:
+    - cron: "20 05 * * *"   # 05:20 UTC (avant Daily Predict à 06:00)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  online_update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # D'abord, tente de partir du dernier modèle online (si déjà existant)
+      - name: Try download latest online models
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: daily_online_update.yml
+          workflow_conclusion: success
+          name: trained-models-online
+          path: .
+
+      # Sinon, fallback: modèles du retrain
+      - name: If no models yet, fallback to retrain artifacts
+        if: ${{ !hashFiles('models/*_model.pkl') }}
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: daily_retrain.yml
+          workflow_conclusion: success
+          name: trained-models
+          path: .
+
+      - name: Run incremental update
+        env:
+          EXCHANGE: ${{ vars.EXCHANGE || 'kucoin' }}
+          SYMBOLS: ${{ vars.SYMBOLS || 'BTC/USDT,ETH/USDT,SOL/USDT' }}
+          TIMEFRAME: ${{ vars.TIMEFRAME || '4h' }}
+          LIMIT: ${{ vars.LIMIT || '5000' }}
+        run: |
+          python -m src.online_update
+          ls -lah models || true
+          ls -lah models_state || true
+
+      - name: Upload updated models (online)
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models-online
+          path: |
+            models/*.pkl
+            models_state/*.json
+          if-no-files-found: error
