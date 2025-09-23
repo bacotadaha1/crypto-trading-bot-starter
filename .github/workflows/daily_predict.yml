@@ -2,11 +2,11 @@ name: Daily Predict (Telegram)
 
 on:
   schedule:
-    - cron: "00 06 * * *"   # 06:00 UTC, après le retrain
+    - cron: "00 06 * * *"   # 06:00 UTC — après Online Update & (éventuel) Retrain
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # <— on doit avoir 'write' pour pousser preds_log.csv
+  contents: write   # nécessaire pour committer data/preds_log.csv
 
 jobs:
   predict:
@@ -26,8 +26,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Récupère le dernier artifact de modèles entraînés (depuis daily_retrain.yml)
-      - name: Download trained models artifact
+      # 1) Priorité aux modèles "online" produits par daily_online_update.yml
+      - name: Try download online models
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: daily_online_update.yml
+          workflow_conclusion: success
+          name: trained-models-online
+          path: .
+
+      # 2) Si aucun modèle online n'est présent, fallback vers les modèles du retrain
+      - name: If no models, fallback to retrain artifacts
+        if: ${{ !hashFiles('models/*_model.pkl') }}
         uses: dawidd6/action-download-artifact@v6
         with:
           workflow: daily_retrain.yml
@@ -35,9 +46,11 @@ jobs:
           name: trained-models
           path: .
 
-      - name: Show models content
+      - name: Show models content (debug)
         run: |
+          echo "== Repo root =="
           ls -lah
+          echo "== models/ =="
           ls -lah models || true
 
       - name: Run daily prediction (sends Telegram)
@@ -51,21 +64,19 @@ jobs:
         run: |
           python -m src.predict
 
-      # >>> NOUVEAU : on versionne le journal des prédictions <<<
+      # Versionne uniquement le journal des prédictions
       - name: Commit & push preds_log.csv
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
-          # s'assure que le dossier existe
           mkdir -p data
-          # ajoute seulement le journal
           git add data/preds_log.csv || true
           git commit -m "Append daily prediction to preds_log.csv" || echo "Nothing to commit"
           git push
 
-      # (optionnel) on garde aussi le log en artifact pour debug
+      # (Optionnel) Conserve aussi le log en artifact pour debug
       - name: Upload preds log artifact
         if: always()
         uses: actions/upload-artifact@v4
