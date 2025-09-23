@@ -2,11 +2,11 @@ name: Daily Predict (Telegram)
 
 on:
   schedule:
-    - cron: "00 06 * * *"   # 06:00 UTC — après Online Update & (éventuel) Retrain
+    - cron: "00 06 * * *"   # 06:00 UTC
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # nécessaire pour committer data/preds_log.csv
+  contents: write   # on pousse seulement preds_log.csv
 
 jobs:
   predict:
@@ -26,8 +26,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 1) Priorité aux modèles "online" produits par daily_online_update.yml
-      - name: Try download online models
+      # 1) Essaye d'abord les modèles "online" (incrémental) du dernier run
+      - name: Try download ONLINE models (if any)
         continue-on-error: true
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -36,8 +36,8 @@ jobs:
           name: trained-models-online
           path: .
 
-      # 2) Si aucun modèle online n'est présent, fallback vers les modèles du retrain
-      - name: If no models, fallback to retrain artifacts
+      # 2) Si aucun modèle récupéré, fallback sur le retrain quotidien
+      - name: Fallback to RETRAIN models
         if: ${{ !hashFiles('models/*_model.pkl') }}
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -46,11 +46,11 @@ jobs:
           name: trained-models
           path: .
 
-      - name: Show models content (debug)
+      - name: Show models content
         run: |
-          echo "== Repo root =="
+          echo "== repo root =="
           ls -lah
-          echo "== models/ =="
+          echo "== models =="
           ls -lah models || true
 
       - name: Run daily prediction (sends Telegram)
@@ -60,11 +60,11 @@ jobs:
           TIMEFRAME: ${{ vars.TIMEFRAME || '4h' }}
           LIMIT: ${{ vars.LIMIT || '5000' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -m src.predict
 
-      # Versionne uniquement le journal des prédictions
+      # On versionne SEULEMENT le journal des prédictions
       - name: Commit & push preds_log.csv
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -76,8 +76,7 @@ jobs:
           git commit -m "Append daily prediction to preds_log.csv" || echo "Nothing to commit"
           git push
 
-      # (Optionnel) Conserve aussi le log en artifact pour debug
-      - name: Upload preds log artifact
+      - name: Upload preds log artifact (optional)
         if: always()
         uses: actions/upload-artifact@v4
         with:
