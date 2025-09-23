@@ -12,7 +12,8 @@ import pandas as pd
 import joblib
 
 from src.config import settings
-from src.ingestion import make_client  # client CCXT construit depuis settings
+from src.ingestion import make_client
+from src.alt_data import build_alt_features  # <<< NEW
 
 
 # ------------------------- helpers -------------------------
@@ -22,15 +23,17 @@ def _sym_to_fname(symbol: str) -> str:
 
 def _build_features(df: pd.DataFrame, vol_window: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Features simples & robustes, cohérentes avec l'entraînement quick-start.
-    - ret_1, moyennes/écarts glissants, RSI, range, z-score, volume.
+    Features techniques + alt-features (sentiment, fear&greed, régime).
     """
     df = df.copy()
+    # ts
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+
+    # techniques
     df["ret_1"] = df["close"].pct_change()
     df["roll_mean"] = df["close"].rolling(vol_window).mean()
-    df["roll_std"] = df["close"].rolling(vol_window).std()
+    df["roll_std"]  = df["close"].rolling(vol_window).std()
 
-    # RSI 14 très simple
     delta = df["close"].diff()
     up = np.where(delta > 0, delta, 0.0)
     down = np.where(delta < 0, -delta, 0.0)
@@ -39,15 +42,18 @@ def _build_features(df: pd.DataFrame, vol_window: int) -> tuple[pd.DataFrame, pd
     rs = roll_up / (roll_down.replace(0, np.nan))
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # forme de bougie & normalisation
     df["hl_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
     df["price_z"] = (df["close"] - df["roll_mean"]) / (df["roll_std"].replace(0, np.nan))
 
-    df = df.dropna().copy()
+    base_feats = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
+    X_base = df[["ts", *base_feats]].copy()
 
-    feats = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
-    X = df[feats].copy()
-    return X, df
+    # alt-features alignées
+    alt = build_alt_features(df_price=df[["ts", "close", "volume"]])
+    X = pd.merge(X_base.set_index("ts"), alt, left_index=True, right_index=True, how="left").dropna()
+
+    return X, df.set_index("ts")
+
 
 def _send_telegram(msg: str) -> None:
     token = getattr(settings, "telegram_bot_token", "") or ""
@@ -72,10 +78,6 @@ def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     return df
 
 def load_model_for(symbol: str):
-    """
-    Charge le modèle sauvegardé pour un symbole :
-    ex: models/BTC_USDT_model.pkl
-    """
     path = Path("models") / f"{_sym_to_fname(symbol)}_model.pkl"
     if not path.exists():
         raise FileNotFoundError(f"Aucun modèle trouvé pour {symbol} dans ./models/")
@@ -90,21 +92,20 @@ def predict_one_symbol(ex, symbol: str) -> dict:
 
     model, model_path = load_model_for(symbol)
 
-    # dernière observation
-    x_last = X.iloc[-1:].copy()
+    # dernière observation prête
+    x_last = X.iloc[-1:].copy().values
 
-    # classification (predict_proba) ou régression -> pseudo-proba
     if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(x_last.values)
-        p_up = float(proba[0, -1])  # proba de la classe "UP"
+        proba = model.predict_proba(x_last)
+        p_up = float(proba[0, -1])
         direction = "UP" if p_up >= 0.5 else "DOWN"
     else:
-        y_val = float(model.predict(x_last.values)[0])
+        y_val = float(model.predict(x_last)[0])
         p_up = 1.0 / (1.0 + math.exp(-10.0 * y_val))
         direction = "UP" if y_val >= 0 else "DOWN"
 
     last_close = float(df_full["close"].iloc[-1])
-    tstamp = df_full["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
+    tstamp = df_full.index[-1].strftime("%Y-%m-%d %H:%M UTC")
 
     return {
         "symbol": symbol,
@@ -120,8 +121,6 @@ def predict_one_symbol(ex, symbol: str) -> dict:
 
 def main():
     ex = make_client()
-
-    # s'assurer que settings.symbols soit bien une liste
     symbols = settings.symbols
     if isinstance(symbols, str):
         symbols = [s.strip() for s in symbols.split(",") if s.strip()]
@@ -134,12 +133,11 @@ def main():
         except Exception as e:
             results.append({"symbol": symbol, "error": str(e)})
 
-    # ——— message Telegram
     limit_txt = f"  Limit: {settings.limit}" if hasattr(settings, "limit") else ""
     lines = [
-        "*Signal quotidien (ML)*",
-        f"Exchange: `***`   testnet: `{settings.use_testnet}`",
-        f"Timeframe: `***`{limit_txt}",
+        "*Signal quotidien (ML + Sentiment)*",
+        f"Exchange: `{settings.exchange}`   testnet: `{settings.use_testnet}`",
+        f"Timeframe: `{settings.timeframe}`{limit_txt}",
         ""
     ]
     for r in results:
@@ -157,13 +155,12 @@ def main():
     print(msg)
     _send_telegram(msg)
 
-    # ——— log JSON (facultatif)
+    # logs
     Path("data").mkdir(parents=True, exist_ok=True)
     out_json = Path("data") / f"predictions_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    # ——— journalisation CSV pour évaluation ultérieure (NOUVEAU)
     log_path = Path("data") / "preds_log.csv"
     rows = []
     ts_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
