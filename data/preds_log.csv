@@ -23,3 +23,6 @@ ts_utc,exchange,timeframe,symbol,last_close,p_up,direction,error
 2025-09-23 21:56:32,kucoin,4h,BTC/USDT,,,,"X has 12 features, but SGDClassifier is expecting 7 features as input."
 2025-09-23 21:56:32,kucoin,4h,ETH/USDT,,,,"X has 12 features, but SGDClassifier is expecting 7 features as input."
 2025-09-23 21:56:32,kucoin,4h,SOL/USDT,,,,"X has 12 features, but SGDClassifier is expecting 7 features as input."
+2025-09-23 22:19:25,kucoin,4h,BTC/USDT,,,,"Cannot interpret 'datetime64[ns, UTC]' as a data type"
+2025-09-23 22:19:25,kucoin,4h,ETH/USDT,,,,"Cannot interpret 'datetime64[ns, UTC]' as a data type"
+2025-09-23 22:19:25,kucoin,4h,SOL/USDT,,,,"Cannot interpret 'datetime64[ns, UTC]' as a data type"
