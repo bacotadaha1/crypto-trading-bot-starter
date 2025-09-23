@@ -1,15 +1,15 @@
-name: Daily Retrain Models
+name: Daily Predict (Telegram)
 
 on:
   schedule:
-    - cron: "30 05 * * *" # 05:30 UTC
+    - cron: "00 06 * * *"   # 06:00 UTC — après Online Update & (éventuel) Retrain
   workflow_dispatch: {}
 
 permissions:
-  contents: read   # pas de push de .pkl dans le repo
+  contents: write   # nécessaire pour committer data/preds_log.csv
 
 jobs:
-  retrain:
+  predict:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,30 +26,61 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug settings (echo)
-        run: |
-          echo "EXCHANGE=${{ vars.EXCHANGE || 'kucoin' }}"
-          echo "SYMBOLS=${{ vars.SYMBOLS || 'BTC/USDT,ETH/USDT,SOL/USDT' }}"
-          echo "TIMEFRAME=${{ vars.TIMEFRAME || '4h' }}"
-          echo "LIMIT=${{ vars.LIMIT || '5000' }}"
+      # 1) Priorité aux modèles "online" produits par daily_online_update.yml
+      - name: Try download online models
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: daily_online_update.yml
+          workflow_conclusion: success
+          name: trained-models-online
+          path: .
 
-      - name: Fetch OHLCV & train models
+      # 2) Si aucun modèle online n'est présent, fallback vers les modèles du retrain
+      - name: If no models, fallback to retrain artifacts
+        if: ${{ !hashFiles('models/*_model.pkl') }}
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: daily_retrain.yml
+          workflow_conclusion: success
+          name: trained-models
+          path: .
+
+      - name: Show models content (debug)
+        run: |
+          echo "== Repo root =="
+          ls -lah
+          echo "== models/ =="
+          ls -lah models || true
+
+      - name: Run daily prediction (sends Telegram)
         env:
-          # Tu peux aussi mettre ces valeurs dans Variables du repo (Actions > Variables)
           EXCHANGE: ${{ vars.EXCHANGE || 'kucoin' }}
           SYMBOLS: ${{ vars.SYMBOLS || 'BTC/USDT,ETH/USDT,SOL/USDT' }}
           TIMEFRAME: ${{ vars.TIMEFRAME || '4h' }}
           LIMIT: ${{ vars.LIMIT || '5000' }}
-          DATA_DIR: ./data
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python -m src.train
+          python -m src.predict
 
-      # IMPORTANT : on ne push rien, on publie les modèles en artifact
-      - name: Upload trained models
+      # Versionne uniquement le journal des prédictions
+      - name: Commit & push preds_log.csv
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          mkdir -p data
+          git add data/preds_log.csv || true
+          git commit -m "Append daily prediction to preds_log.csv" || echo "Nothing to commit"
+          git push
+
+      # (Optionnel) Conserve aussi le log en artifact pour debug
+      - name: Upload preds log artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trained-models
-          path: |
-            models/
-            data/ml_training_report.csv
-          if-no-files-found: error
+          name: preds-log
+          path: data/preds_log.csv
+          if-no-files-found: warn
