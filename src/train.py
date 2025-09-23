@@ -2,6 +2,8 @@
 from __future__ import annotations
 import time
 from pathlib import Path
+from typing import Tuple
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -26,6 +28,7 @@ def _parse_symbols() -> list[str]:
         return [s.strip() for s in settings.symbols.split(",") if s.strip()]
     return ["BTC/USDT"]
 
+
 def _safe_fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int, retries: int = 4, backoff: float = 2.0):
     for i in range(retries):
         try:
@@ -35,9 +38,11 @@ def _safe_fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int, retries: int 
                 raise
             time.sleep(backoff * (i + 1))
 
+
 def ensure_training_csv() -> None:
     """
     Crée data/training_data.csv si absent en téléchargeant l'OHLCV.
+    Sauvegarde colonnes: [timestamp(ms), open, high, low, close, volume, symbol]
     """
     if CSV_PATH.exists():
         print(f"✅ {CSV_PATH} existe déjà — on continue.")
@@ -57,6 +62,7 @@ def ensure_training_csv() -> None:
         if not ohlcv:
             print(f"⚠️  Aucune donnée pour {sym} — ignoré.")
             continue
+
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["symbol"] = sym
         frames.append(df)
@@ -69,16 +75,28 @@ def ensure_training_csv() -> None:
     print(f"✅ Données créées : {CSV_PATH.resolve()} (rows={len(out)})")
 
 
-# ---------- features ----------
-def _build_features_train(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+def _prepare_df_symbol(df_sym: pd.DataFrame) -> pd.DataFrame:
     """
-    Construit features techniques + alt-data, et une cible (UP/DOWN à 1 step).
+    Normalise le DataFrame d'un symbole:
+      - crée 'ts' (datetime UTC) à partir de 'timestamp' (ms) si nécessaire
+      - tri + colonnes minimales
     """
-    df = df.copy()
-    # ts UTC
-    df["ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df_sym.copy()
+    if "ts" not in df.columns:
+        # le CSV a 'timestamp' en millisecondes
+        df["ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.sort_values("ts").reset_index(drop=True)
+    return df[["ts", "open", "high", "low", "close", "volume"]]
 
-    # base features
+
+def _build_features_train(df_in: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Construit les mêmes features que la prédiction (prix + alt-data) et la cible (UP/DOWN à 1 step).
+    Robuste si alt-data absente : remplissage à 0.0.
+    """
+    df = df_in.copy()
+
+    # ----- prix
     df["ret_1"] = df["close"].pct_change()
     roll = int(getattr(settings, "vol_window", 12))
     df["roll_mean"] = df["close"].rolling(roll).mean()
@@ -93,52 +111,66 @@ def _build_features_train(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     df["rsi"] = 100 - (100 / (1 + rs))
 
     df["hl_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
-    df["price_z"] = (df["close"] - df["roll_mean"]) / df["roll_std"].replace(0, np.nan)
+    df["price_z"] = (df["close"] - df["roll_mean"]) / (df["roll_std"].replace(0, np.nan))
 
-    # cible (direction prochaine bougie)
+    # ----- alt-data alignée ts
+    alt = build_alt_features(df[["ts", "close", "volume"]])
+    df = df.set_index("ts").join(alt, how="left").reset_index()
+
+    alt_cols = ["sent_hour", "fg_idx", "rv_w6", "rv_w36", "vol_z"]
+    for col in alt_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = df[col].fillna(0.0)
+
+    # cible = signe du retour futur
     df["future_ret"] = df["close"].pct_change().shift(-1)
     y = (df["future_ret"] > 0).astype("int8")
 
-    base_feats = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
-    X_base = df[["ts", *base_feats]].copy()
+    # drop uniquement sur le noyau "prix" nécessaire
+    core_needed = ["ret_1", "roll_mean", "roll_std", "rsi", "future_ret"]
+    df = df.dropna(subset=core_needed).copy()
 
-    # alt-features (sentiment RSS, fear/greed, régime)
-    alt = build_alt_features(df_price=df[["ts", "close", "volume"]])
-    # merge sur ts (left join) + alignement
-    X = pd.merge(X_base.set_index("ts"), alt, left_index=True, right_index=True, how="left")
+    feats = [
+        "ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume",
+        "sent_hour", "fg_idx", "rv_w6", "rv_w36", "vol_z",
+    ]
+    X = df[feats].astype("float32")
+    y = y.loc[X.index].astype("int8")
 
-    # clean
-    xy = pd.concat([X, y.rename("y")], axis=1).dropna()
-    X = xy.drop(columns=["y"]).astype("float32")
-    y = xy["y"].astype("int8")
     return X, y
 
 
-# ---------- train ----------
 def train_models() -> None:
+    """
+    Entraîne un modèle compact par symbole et le sauvegarde compressé (<100MB).
+    - RandomForest limité en profondeur
+    - compression joblib
+    - CV TimeSeriesSplit (log d’info)
+    """
     df_all = pd.read_csv(CSV_PATH)
     print(f"📦 training_data.csv lu : {len(df_all)} lignes, {df_all['symbol'].nunique()} symboles.")
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     symbols = sorted(df_all["symbol"].unique())
     for symbol in symbols:
-        df = df_all[df_all["symbol"] == symbol].copy()
-        X, y = _build_features_train(df)
+        base = _prepare_df_symbol(df_all[df_all["symbol"] == symbol])
+        X, y = _build_features_train(base)
         if len(X) < 200:
             print(f"⚠️  Trop peu d'observations pour {symbol} — skip.")
             continue
 
         model = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=10,
+            n_estimators=120,
+            max_depth=8,
             min_samples_leaf=5,
             n_jobs=-1,
             random_state=42,
         )
 
-        # CV temps (AUC) — l’impact des alt-features se verra ici
+        # (optionnel) CV pour info
+        tscv = TimeSeriesSplit(n_splits=5)
         try:
-            tscv = TimeSeriesSplit(n_splits=5)
             scores = cross_val_score(model, X.values, y.values, cv=tscv, scoring="roc_auc", n_jobs=-1)
             print(f"📈 {symbol} | AUC CV (5 folds): {scores.mean():.3f} ± {scores.std():.3f}")
         except Exception as e:
@@ -146,10 +178,12 @@ def train_models() -> None:
 
         model.fit(X.values, y.values)
 
+        # --- sauvegarde compressée ---
         model_path = MODELS_DIR / f"{symbol.replace('/','_')}_model.pkl"
         joblib.dump(model, model_path, compress=3)
         print(f"✅ Modèle sauvegardé (compressé) : {model_path}")
 
+    # petit rapport
     (DATA_DIR / "ml_training_report.csv").write_text(
         f"rows,{len(df_all)}\nsymbols,{','.join(symbols)}\n", encoding="utf-8"
     )
