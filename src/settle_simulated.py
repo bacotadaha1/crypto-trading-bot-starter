@@ -1,140 +1,159 @@
 # src/settle_simulated.py
 from __future__ import annotations
+
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
-import csv
 
 import pandas as pd
 import numpy as np
 
 from src.config import settings
-from src.ingestion import make_client
-from src.strategy import compute_atr
-from src.predict import fetch_ohlcv_df
+# ✅ IMPORTANT : on importe depuis action_strategy (et pas strategy)
+from src.action_strategy import compute_atr  # noqa: F401  (utile si tu veux l'utiliser plus tard)
 
-ORDERS = Path("data") / "orders_log.csv"
-FILLS  = Path("data") / "fills_log.csv"
 
-def _read_orders() -> list[dict]:
-    if not ORDERS.exists():
-        return []
-    out = []
-    with ORDERS.open("r", encoding="utf-8") as f:
-        for i, row in enumerate(csv.DictReader(f)):
-            out.append(row)
-    return out
+DATA_DIR = settings.data_dir
+FILLS_CSV = DATA_DIR / "fills_log.csv"     # créé par le moteur d'exécution si des ordres sont simulés/exécutés
+PNL_CSV   = DATA_DIR / "pnl_report.csv"    # rapport de PnL (on le génère ici)
 
-def _append_fill(row: dict):
-    FILLS.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not FILLS.exists()
-    with FILLS.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header: w.writeheader()
-        w.writerow(row)
 
-def _as_float(x, default=0.0):
+def _now_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_read_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
     try:
-        return float(x)
+        return pd.read_csv(path)
     except Exception:
-        return default
+        # si le fichier est vide/corrompu, on renvoie un DF vide
+        return pd.DataFrame()
 
-def _parse_ts(ts_str: str):
-    # ts_utc = "2025-09-24T06:12:00+00:00" ou "2025-09-24 06:12:00"
-    try:
-        return datetime.fromisoformat(ts_str.replace("Z","+00:00")).astimezone(timezone.utc)
-    except Exception:
+
+def _pair_trades_and_pnl(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcule un PnL grossier en pairant les BUY/SELL par symbole dans l'ordre chronologique.
+    Colonnes attendues idéalement: ['ts','symbol','side','qty','price','fee']
+    - S'il manque des colonnes, on essaie des fallback avec des noms proches.
+    - Si rien n'est exploitable, on retourne un DF vide -> le script termine OK.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    # normalisation colonnes
+    cols = {c.lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n in cols:
+                return cols[n]
         return None
 
-def settle_one(ex, o: dict):
-    symbol = o["symbol"]
-    side   = o["side"]
-    price  = _as_float(o["price"], 0.0) if "price" in o else None  # dans nos logs initiaux on n’avait pas la colonne price
-    qty    = _as_float(o["qty"], 0.0)
-    sl     = _as_float(o["sl"], 0.0)
-    tp     = _as_float(o["tp"], 0.0)
-    ts     = _parse_ts(o.get("ts_utc", ""))
+    c_ts     = pick("ts", "time", "timestamp")
+    c_sym    = pick("symbol", "sym")
+    c_side   = pick("side", "action", "type")
+    c_qty    = pick("qty", "quantity", "size", "amount")
+    c_price  = pick("price", "px", "fill_price")
+    c_fee    = pick("fee", "fees", "commission")
 
-    if qty <= 0 or sl <= 0 or tp <= 0 or ts is None:
-        return
+    # colonnes minimales nécessaires
+    required = [c_ts, c_sym, c_side, c_qty, c_price]
+    if any(x is None for x in required):
+        return pd.DataFrame()  # structure inconnue -> on sort proprement
 
-    # on récupère les bougies APRÈS l’entrée pour vérifier si tp/sl touché
-    # on prend une marge de 20 bougies (≈3,3 jours sur 4h)
-    df = fetch_ohlcv_df(ex, symbol, settings.timeframe, limit=settings.limit)
-    df = df.sort_values("ts").reset_index(drop=True)
-    # on cherche la 1ère bougie APRÈS l’entrée
-    idx = df.index[df["ts"] > ts]
-    if len(idx) == 0:
-        return
-    start = int(idx.min())
-    look_ahead = df.iloc[start:start+20].copy()
-    if look_ahead.empty:
-        return
+    d = df.copy()
+    d[c_ts] = pd.to_datetime(d[c_ts], errors="coerce", utc=True)
+    d = d.dropna(subset=[c_ts, c_sym, c_side, c_qty, c_price]).sort_values(c_ts)
 
-    outcome = "open"
-    exit_ts = None
-    exit_px = None
-
-    for _, r in look_ahead.iterrows():
-        h = float(r["high"]); l = float(r["low"])
-        if side == "buy":
-            if l <= sl:
-                outcome = "stopped"
-                exit_px = sl
-                exit_ts = r["ts"]
-                break
-            if h >= tp:
-                outcome = "takeprofit"
-                exit_px = tp
-                exit_ts = r["ts"]
-                break
-        else:  # sell
-            if h >= sl:
-                outcome = "stopped"
-                exit_px = sl
-                exit_ts = r["ts"]
-                break
-            if l <= tp:
-                outcome = "takeprofit"
-                exit_px = tp
-                exit_ts = r["ts"]
-                break
-
-    if outcome == "open":
-        # position toujours ouverte => on marque à la dernière clôture observée
-        exit_ts = look_ahead["ts"].iloc[-1]
-        exit_px = float(look_ahead["close"].iloc[-1])
-        outcome = "mark"
-
-    # PnL (en unités quote, ex: USDT)
-    if side == "buy":
-        pnl = (exit_px - price) * qty if price else 0.0
+    # casting numériques
+    for cc in [c_qty, c_price]:
+        d[cc] = pd.to_numeric(d[cc], errors="coerce")
+    if c_fee:
+        d[c_fee] = pd.to_numeric(d[c_fee], errors="coerce").fillna(0.0)
     else:
-        pnl = (price - exit_px) * qty if price else 0.0
+        d["__fee__"] = 0.0
+        c_fee = "__fee__"
 
-    row = {
-        "symbol": symbol,
-        "side": side,
-        "entry_ts": ts.isoformat(timespec="seconds"),
-        "entry_price": round(price or 0.0, 6),
-        "qty": round(qty, 6),
-        "exit_ts": exit_ts.isoformat() if isinstance(exit_ts, pd.Timestamp) else str(exit_ts),
-        "exit_price": round(exit_px or 0.0, 6),
-        "outcome": outcome,
-        "pnl_usdt": round(float(pnl), 4),
-    }
-    _append_fill(row)
+    rows = []
+    for sym, grp in d.groupby(c_sym):
+        pos_qty = 0.0
+        avg_cost = 0.0
+        cash_pnl = 0.0
 
-def main():
-    ex = make_client()
-    orders = _read_orders()
-    if not orders:
-        print("Aucun ordre à régler.")
+        for _, r in grp.iterrows():
+            side  = str(r[c_side]).upper()
+            qty   = float(r[c_qty])
+            price = float(r[c_price])
+            fee   = float(r[c_fee])
+
+            if qty <= 0 or price <= 0:
+                continue
+
+            if side.startswith("B"):  # BUY
+                # moyenne pondérée du coût
+                new_qty = pos_qty + qty
+                if new_qty > 0:
+                    avg_cost = (avg_cost * pos_qty + price * qty) / new_qty
+                pos_qty = new_qty
+                cash_pnl -= fee
+            elif side.startswith("S"):  # SELL
+                # on ferme (au moins en partie) la position
+                close_qty = min(pos_qty, qty)
+                if close_qty > 0:
+                    cash_pnl += (price - avg_cost) * close_qty
+                    pos_qty -= close_qty
+                # si vente à découvert non gérée -> on ignore l'excès
+                cash_pnl -= fee
+            else:
+                # side inconnu
+                continue
+
+        rows.append({
+            "symbol": sym,
+            "pnl_cash": cash_pnl,
+            "open_qty": pos_qty,
+            "avg_cost": avg_cost if pos_qty > 0 else np.nan,
+        })
+
+    out = pd.DataFrame(rows)
+    out["ts_utc"] = _now_utc_str()
+    cols_order = ["ts_utc", "symbol", "pnl_cash", "open_qty", "avg_cost"]
+    return out[cols_order]
+
+
+def main() -> None:
+    _ensure_data_dir()
+
+    fills = _safe_read_csv(FILLS_CSV)
+    if fills.empty:
+        # ✅ Aucun fill -> on crée un rapport vide et on sorte avec succès
+        print(f"[SETTLE] {FILLS_CSV} introuvable ou vide — rien à régler aujourd'hui.")
+        PNL_CSV.write_text("ts_utc,symbol,pnl_cash,open_qty,avg_cost\n", encoding="utf-8")
+        print(f"[SETTLE] Rapport vide écrit: {PNL_CSV}")
         return
-    for o in orders[-30:]:   # ne traite que les plus récents pour éviter les doublons massifs
-        try:
-            settle_one(ex, o)
-        except Exception as e:
-            print("Settle error", o.get("symbol"), e)
+
+    pnl = _pair_trades_and_pnl(fills)
+    if pnl.empty:
+        print("[SETTLE] Fichier de fills présent mais structure inconnue — aucun PnL calculé.")
+        PNL_CSV.write_text("ts_utc,symbol,pnl_cash,open_qty,avg_cost\n", encoding="utf-8")
+        print(f"[SETTLE] Rapport vide écrit: {PNL_CSV}")
+        return
+
+    # append si le fichier existe déjà
+    write_header = not PNL_CSV.exists()
+    pnl.to_csv(PNL_CSV, index=False, mode="a", header=write_header)
+    print(f"[SETTLE] Rapport PnL mis à jour -> {PNL_CSV.resolve()}")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # on imprime l'erreur et on retourne un code 1 pour aider au debug
+        print("[SETTLE][ERROR]", repr(e))
+        sys.exit(1)
