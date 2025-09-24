@@ -1,0 +1,44 @@
+name: Daily Trade (DRY-RUN)
+
+on:
+  schedule:
+    - cron: "10 06 * * *"   # après daily_predict
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Download models
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: daily_retrain.yml
+          workflow_conclusion: success
+          name: trained-models
+          path: .
+      - name: Run trading (DRY-RUN)
+        env:
+          EXCHANGE: ${{ vars.EXCHANGE || 'kucoin' }}
+          SYMBOLS: ${{ vars.SYMBOLS || 'BTC/USDT,ETH/USDT,SOL/USDT' }}
+          TIMEFRAME: ${{ vars.TIMEFRAME || '4h' }}
+          LIMIT: ${{ vars.LIMIT || '5000' }}
+          TRADE_ENABLED: "false"           # ← reste en simulation
+        run: |
+          python -m src.trade
+      - name: Upload order logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orders-log
+          path: data/orders_log.csv
+          if-no-files-found: warn
