@@ -10,23 +10,41 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import joblib
-from pandas.api.types import is_datetime64_any_dtype
 
 from src.config import settings
-from src.ingestion import make_client  # client CCXT
-from src.alt_data import build_alt_features  # Fear&Greed + sentiment RSS + regime
+from src.ingestion import make_client
+from src.alt_data import build_alt_features
 
-
-# ============================== Constantes ==============================
-
-# Les 7 features "core" calculées depuis l'OHLCV (utilisées à l'entraînement)
-CORE_FEATS = ["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]
-
-
-# ============================== Utilitaires ==============================
-
+# ---------------- helpers ----------------
 def _sym_to_fname(symbol: str) -> str:
     return symbol.replace("/", "_").replace("-", "_").upper()
+
+def _build_features_tech(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
+    d = df.copy()
+    d["ret_1"] = d["close"].pct_change()
+    d["roll_mean"] = d["close"].rolling(vol_window).mean()
+    d["roll_std"] = d["close"].rolling(vol_window).std()
+
+    delta = d["close"].diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    r_up = pd.Series(up, index=d.index).rolling(14).mean()
+    r_dn = pd.Series(down, index=d.index).rolling(14).mean()
+    rs = r_up / r_dn.replace(0, np.nan)
+    d["rsi"] = 100 - (100 / (1 + rs))
+
+    d["hl_range"] = (d["high"] - d["low"]) / d["close"].replace(0, np.nan)
+    d["price_z"] = (d["close"] - d["roll_mean"]) / d["roll_std"].replace(0, np.nan)
+    return d[["ts","ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume"]]
+
+def _build_full_features(df_price: pd.DataFrame, vol_window: int) -> pd.DataFrame:
+    tech = _build_features_tech(df_price, vol_window=vol_window)
+    alt = build_alt_features(df_price[["ts","close","volume"]])
+    full = (tech
+            .merge(alt.reset_index(), on="ts", how="left")
+            .sort_values("ts"))
+    full = full.set_index("ts").ffill().dropna().reset_index()
+    return full
 
 def _send_telegram(msg: str) -> None:
     token = getattr(settings, "telegram_bot_token", "") or ""
@@ -45,152 +63,46 @@ def _send_telegram(msg: str) -> None:
         print("[WARN] Telegram error:", e)
 
 def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-    """
-    Récupère l'OHLCV et retourne DataFrame avec ts (UTC), open, high, low, close, volume.
-    """
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
 def load_model_for(symbol: str):
-    """
-    Charge le modèle sauvegardé pour un symbole : models/BTC_USDT_model.pkl
-    """
     path = Path("models") / f"{_sym_to_fname(symbol)}_model.pkl"
     if not path.exists():
         raise FileNotFoundError(f"Aucun modèle trouvé pour {symbol} dans ./models/")
-    return joblib.load(path), path
+    payload = joblib.load(path)
+    return payload["model"], payload["features"], int(payload.get("vol_window", 12)), path
 
-
-# ============================== Features ==============================
-
-def _build_core_features(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
-    """
-    Construit les 7 features 'core' utilisées par le training.
-    """
-    out = df.copy()
-
-    # sécurités types
-    if not is_datetime64_any_dtype(out["ts"]):
-        out["ts"] = pd.to_datetime(out["ts"], utc=True, errors="coerce")
-
-    out["ret_1"] = out["close"].pct_change()
-
-    roll = int(vol_window)
-    out["roll_mean"] = out["close"].rolling(roll).mean()
-    out["roll_std"] = out["close"].rolling(roll).std()
-
-    delta = out["close"].diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    r_up = pd.Series(up, index=out.index).rolling(14).mean()
-    r_dn = pd.Series(down, index=out.index).rolling(14).mean()
-    rs = r_up / r_dn.replace(0, np.nan)
-    out["rsi"] = 100 - (100 / (1 + rs))
-
-    out["hl_range"] = (out["high"] - out["low"]) / out["close"].replace(0, np.nan)
-    out["price_z"] = (out["close"] - out["roll_mean"]) / out["roll_std"].replace(0, np.nan)
-
-    # on ne droppe pas tout : on laissera le nettoyage ciblé après le join
-    return out[["ts"] + CORE_FEATS]
-
-def _build_full_feature_table(df_price: pd.DataFrame, vol_window: int) -> pd.DataFrame:
-    """
-    Assemble 'core' + alt-features alignées sur ts.
-    - Alt-features peuvent être partielles : on ffill/bfill.
-    - On ne droppe que si les features 'core' manquent (pas à cause des alt).
-    """
-    core = _build_core_features(df_price, vol_window).copy()
-
-    if not is_datetime64_any_dtype(core["ts"]):
-        core["ts"] = pd.to_datetime(core["ts"], utc=True)
-
-    core_idxed = core.set_index("ts").sort_index()
-
-    # alt-data indexées par ts (peuvent être vides si indispo)
-    alt = build_alt_features(df_price)  # index=ts (sent_hour, fg_idx, rv_w6, rv_w36, vol_z)
-    full = core_idxed.join(alt, how="left")
-
-    # Remplissage souple pour éviter les trous : d'abord ffill puis bfill
-    full = full.ffill().bfill()
-
-    # On NE droppe que si les features 'core' manquent
-    full = full.dropna(subset=CORE_FEATS)
-
-    full = full.copy()
-    full.reset_index(inplace=True)  # remet ts en colonne
-    return full
-
-def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
-    """
-    Aligne X sur l'ordre/ensemble des colonnes attendues par le modèle.
-    - Si le modèle expose feature_names_in_, on les suit.
-    - Sinon, on suppose que les 7 'core' ont été utilisées à l'entraînement.
-    - Toute colonne absente est remplie par 0.
-    """
-    if hasattr(model, "feature_names_in_"):
-        expected = list(model.feature_names_in_)
-    elif hasattr(model, "n_features_in_") and X is not None:
-        # fallback : si pas de noms, on prend d'abord les CORE_FEATS, puis on complète
-        expected = [c for c in CORE_FEATS if c in X.columns]
-        # si le modèle en attend plus, on complète par les colonnes de X dans l'ordre
-        for c in X.columns:
-            if c not in expected and len(expected) < int(model.n_features_in_):
-                expected.append(c)
-        # si encore trop court, on force à CORE_FEATS uniquement
-        if len(expected) < int(model.n_features_in_):
-            # pad avec zéros virtuels (on les créera juste après)
-            expected = expected + [f"__pad_{i}" for i in range(int(model.n_features_in_)-len(expected))]
-    else:
-        expected = [c for c in CORE_FEATS if c in X.columns]
-
-    X_aligned = X.copy()
-    # crée colonnes manquantes (0) sans casser l'ordre
-    for col in expected:
-        if col not in X_aligned.columns:
-            X_aligned[col] = 0.0
-
-    return X_aligned[expected]
-
-
-# ============================== Prédiction ==============================
-
+# --------------- prédiction ---------------
 def predict_one_symbol(ex, symbol: str) -> dict:
-    df_price = fetch_ohlcv_df(ex, symbol, settings.timeframe, settings.limit)
-    if df_price is None or len(df_price) == 0:
-        raise RuntimeError("Téléchargement OHLCV vide.")
+    df = fetch_ohlcv_df(ex, symbol, settings.timeframe, settings.limit)
+    if len(df) < 50:
+        raise RuntimeError("Pas assez de bougies téléchargées.")
 
-    full = _build_full_feature_table(df_price, settings.vol_window)
+    model, feat_cols, vol_window, model_path = load_model_for(symbol)
 
-    if full.empty or len(full) == 0:
-        raise RuntimeError(
-            "Pas de ligne exploitable pour la prédiction (features vides). "
-            "Augmente LIMIT (ex: 5000) ou vérifie le téléchargement OHLCV."
-        )
+    full = _build_full_features(df[["ts","open","high","low","close","volume"]], vol_window=vol_window)
 
-    # X complet (core + alt), puis on alignera aux attentes du modèle
-    X_all = full.drop(columns=["ts"])
-    x_last_all = X_all.iloc[-1:].copy()
+    if not set(feat_cols).issubset(full.columns):
+        missing = [c for c in feat_cols if c not in full.columns]
+        raise RuntimeError(f"Colonnes manquantes dans les features: {missing}")
 
-    model, model_path = load_model_for(symbol)
-    x_last = _align_features_to_model(x_last_all, model)
+    X = full[feat_cols].astype("float32")
+    if len(X) == 0:
+        raise RuntimeError("Aucune ligne exploitable après feature engineering.")
 
-    if x_last.shape[0] == 0:
-        raise RuntimeError("Aucune ligne finale après alignement des features.")
+    x_last = X.iloc[-1:].copy()
 
-    # Prédiction
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(x_last.values)
-        p_up = float(proba[0, -1])  # proba classe "UP"
-        direction = "UP" if p_up >= 0.5 else "DOWN"
-    else:
-        y_val = float(model.predict(x_last.values)[0])
-        p_up = 1.0 / (1.0 + math.exp(-10.0 * y_val))  # squashing pour pseudo-proba
-        direction = "UP" if y_val >= 0 else "DOWN"
+    # modèle calibré -> predict_proba fiable
+    proba = model.predict_proba(x_last.values)
+    p_up = float(proba[0, -1])
+    direction = "UP" if p_up >= 0.5 else "DOWN"
 
-    last_close = float(df_price["close"].iloc[-1])
-    tstamp = pd.to_datetime(df_price["ts"].iloc[-1], utc=True).strftime("%Y-%m-%d %H:%M UTC")
+    last_row = full.iloc[-1]
+    last_close = float(df["close"].iloc[-1])
+    tstamp = df["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
 
     return {
         "symbol": symbol,
@@ -201,13 +113,10 @@ def predict_one_symbol(ex, symbol: str) -> dict:
         "model_path": str(model_path),
     }
 
-
-# ============================== Main ==============================
-
+# --------------- main ---------------
 def main():
     ex = make_client()
 
-    # s'assurer que settings.symbols soit bien une liste
     symbols = settings.symbols
     if isinstance(symbols, str):
         symbols = [s.strip() for s in symbols.split(",") if s.strip()]
@@ -220,11 +129,9 @@ def main():
         except Exception as e:
             results.append({"symbol": symbol, "error": str(e)})
 
-    # ——— message Telegram
     limit_txt = f"  Limit: {settings.limit}" if hasattr(settings, "limit") else ""
-    title = "*Signal quotidien (ML + Sentiment)*"
     lines = [
-        title,
+        "*Signal quotidien (ML + Sentiment)*",
         f"Exchange: `kucoin`   testnet: `{settings.use_testnet}`",
         f"Timeframe: `4h`{limit_txt}",
         ""
@@ -244,13 +151,13 @@ def main():
     print(msg)
     _send_telegram(msg)
 
-    # ——— log JSON (facultatif)
+    # log json
     Path("data").mkdir(parents=True, exist_ok=True)
     out_json = Path("data") / f"predictions_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    # ——— journalisation CSV pour l’évaluation ultérieure
+    # journal CSV (pour l’évaluation)
     log_path = Path("data") / "preds_log.csv"
     rows = []
     ts_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -277,15 +184,12 @@ def main():
                 "direction": r["direction"],
                 "error": None,
             })
-
-    if rows:
-        write_header = not log_path.exists()
-        with log_path.open("a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            if write_header:
-                w.writeheader()
-            w.writerows(rows)
-
+    write_header = not log_path.exists()
+    with log_path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        if write_header:
+            w.writeheader()
+        w.writerows(rows)
 
 if __name__ == "__main__":
     main()
