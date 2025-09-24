@@ -32,3 +32,6 @@ ts_utc,exchange,timeframe,symbol,last_close,p_up,direction,error
 2025-09-24 04:08:57,kucoin,4h,BTC/USDT,111538.0,1.0,UP,
 2025-09-24 04:08:57,kucoin,4h,ETH/USDT,4114.81,0.0,DOWN,
 2025-09-24 04:08:57,kucoin,4h,SOL/USDT,206.48,1.0,UP,
+2025-09-24 06:22:30,kucoin,4h,BTC/USDT,112544.0,0.0,DOWN,
+2025-09-24 06:22:30,kucoin,4h,ETH/USDT,4168.91,1.0,UP,
+2025-09-24 06:22:30,kucoin,4h,SOL/USDT,208.67,1.0,UP,
