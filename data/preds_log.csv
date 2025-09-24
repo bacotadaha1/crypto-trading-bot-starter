@@ -38,3 +38,6 @@ ts_utc,exchange,timeframe,symbol,last_close,p_up,direction,error
 2025-09-24 10:57:59,kucoin,4h,BTC/USDT,,,,'SGDClassifier' object is not subscriptable
 2025-09-24 10:57:59,kucoin,4h,ETH/USDT,,,,'SGDClassifier' object is not subscriptable
 2025-09-24 10:57:59,kucoin,4h,SOL/USDT,,,,'SGDClassifier' object is not subscriptable
+2025-09-24 11:48:32,kucoin,4h,BTC/USDT,113021.8,0.0,DOWN,
+2025-09-24 11:48:32,kucoin,4h,ETH/USDT,4182.73,1.0,UP,
+2025-09-24 11:48:32,kucoin,4h,SOL/USDT,212.01,1.0,UP,
