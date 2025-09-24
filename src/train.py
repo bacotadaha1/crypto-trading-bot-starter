@@ -2,32 +2,32 @@
 from __future__ import annotations
 import time
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 import joblib
 
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import SGDClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from src.config import settings
 from src.ingestion import make_client
-from src.alt_data import build_alt_features  # alt-data: sentiment RSS, fear&greed, régimes
+from src.alt_data import build_alt_features
 
 DATA_DIR = settings.data_dir
 CSV_PATH = DATA_DIR / "training_data.csv"
 MODELS_DIR = Path("models")
 
-
-# ---------- utilitaires ----------
+# ------------- helpers -------------
 def _parse_symbols() -> list[str]:
     if isinstance(settings.symbols, (list, tuple)):
         return [s.strip() for s in settings.symbols if s.strip()]
     if isinstance(settings.symbols, str):
         return [s.strip() for s in settings.symbols.split(",") if s.strip()]
     return ["BTC/USDT"]
-
 
 def _safe_fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int, retries: int = 4, backoff: float = 2.0):
     for i in range(retries):
@@ -37,7 +37,6 @@ def _safe_fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int, retries: int 
             if i == retries - 1:
                 raise
             time.sleep(backoff * (i + 1))
-
 
 def ensure_training_csv() -> None:
     """
@@ -61,134 +60,148 @@ def ensure_training_csv() -> None:
         if not ohlcv:
             print(f"⚠️  Aucune donnée pour {sym} — ignoré.")
             continue
-
-        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         df["symbol"] = sym
         frames.append(df)
 
     if not frames:
         raise RuntimeError("Aucune donnée téléchargée — impossible de créer training_data.csv")
 
-    out = pd.concat(frames, ignore_index=True).sort_values(["symbol", "timestamp"])
+    out = pd.concat(frames, ignore_index=True).sort_values(["symbol", "ts"])
     out.to_csv(CSV_PATH, index=False)
     print(f"✅ Données créées : {CSV_PATH.resolve()} (rows={len(out)})")
 
+# ---------- features techniques (comme dans predict) ----------
+def _build_features_tech(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
+    d = df.copy()
+    d["ret_1"] = d["close"].pct_change()
+    d["roll_mean"] = d["close"].rolling(vol_window).mean()
+    d["roll_std"] = d["close"].rolling(vol_window).std()
 
-# ---------- features (les mêmes que dans predict.py) ----------
-def _build_features_train(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    """
-    Construit les features techniques + alt-data alignées, et la cible binaire (UP/DOWN à +1 step).
-    Retourne X (float32) et y (int8).
-    """
-    df = df_raw.copy()
-    # tri & index temps UTC
-    df = df.sort_values("timestamp")
-    ts = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df["ts"] = ts
-
-    # --- features techniques
-    roll = int(getattr(settings, "vol_window", 12))
-    df["ret_1"] = df["close"].pct_change()
-    df["roll_mean"] = df["close"].rolling(roll).mean()
-    df["roll_std"] = df["close"].rolling(roll).std()
-
-    delta = df["close"].diff()
+    delta = d["close"].diff()
     up = np.where(delta > 0, delta, 0.0)
     down = np.where(delta < 0, -delta, 0.0)
-    r_up = pd.Series(up, index=df.index).rolling(14).mean()
-    r_dn = pd.Series(down, index=df.index).rolling(14).mean()
+    r_up = pd.Series(up, index=d.index).rolling(14).mean()
+    r_dn = pd.Series(down, index=d.index).rolling(14).mean()
     rs = r_up / r_dn.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    d["rsi"] = 100 - (100 / (1 + rs))
 
-    df["hl_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
-    df["price_z"] = (df["close"] - df["roll_mean"]) / df["roll_std"].replace(0, np.nan)
+    d["hl_range"] = (d["high"] - d["low"]) / d["close"].replace(0, np.nan)
+    d["price_z"] = (d["close"] - d["roll_mean"]) / d["roll_std"].replace(0, np.nan)
+    return d[["ts","ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume"]]
 
-    # --- alt-data (sentiment RSS horaire, fear&greed, régimes de marché)
-    alt = build_alt_features(df[["ts", "close", "volume"]])
-    # jointure sur ts
-    base = df.set_index("ts")
-    feat = pd.concat(
-        [
-            base[["ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume"]],
-            alt.reindex(base.index, method="ffill"),
-        ],
-        axis=1,
-    )
+def _build_full_features(df_price: pd.DataFrame, vol_window: int) -> pd.DataFrame:
+    """
+    Construit le même set de features que pour la prédiction:
+    - Techniques
+    - Alt-data (sentiment RSS horaire, Fear&Greed daily, régimes)
+    Fusion alignée sur ts (UTC), forward-fill pour éviter les trous.
+    """
+    tech = _build_features_tech(df_price, vol_window=vol_window)
 
-    # cible: direction prochaine bougie
-    future_ret = base["close"].pct_change().shift(-1)
-    y = (future_ret > 0).astype("int8")
+    alt = build_alt_features(df_price[["ts","close","volume"]])
+    # merge sur ts (outer pour garder chaque bougie), puis tri/ffill
+    full = (tech
+            .merge(alt.reset_index(), on="ts", how="left")
+            .sort_values("ts"))
+    full = full.set_index("ts").ffill().dropna().reset_index()
+    return full
 
-    # nettoyage
-    all_cols = [
-        "ret_1", "roll_mean", "roll_std", "rsi", "hl_range", "price_z", "volume",
-        "sent_hour", "fg_idx", "rv_w6", "rv_w36", "vol_z",
+def _make_Xy(df_full: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Crée X,y avec cible = direction prochaine bougie.
+    """
+    d = df_full.copy()
+    d["future_ret"] = d["price_z"].index  # dummy write to allocate column
+    # cible (utilise close de la source d’origine)
+    # on suppose que df_full contient 'close' original (via merge initial), sinon on le repasse
+    # si close n'est pas là, on ne l’utilise pas directement; on repart de ret_1 du tech
+    # calcule future ret depuis 'ret_1' d’origine : shift de ret_1 vers -1 n’est pas correct
+    # => on a besoin de close original; on l’ajoute depuis df_price avant build_full_features.
+    # Ajustons: on recalcule depuis ret_1 cumulé.
+    # Plus simple: on redemande close via join rapide :
+    # (le CSV d’entraînement contient 'close', on l’a dans df_price avant)
+    # Ici, on suppose qu’on a 'close' (on va l’assurer avant l’appel).
+    if "close" not in d.columns:
+        raise RuntimeError("La colonne 'close' est requise pour la cible future. Assure-toi qu’elle est présente.")
+    d["future_ret"] = d["close"].pct_change().shift(-1)
+    y = (d["future_ret"] > 0).astype("int8")
+
+    # colonnes features (tech + alt)
+    feat_cols = [
+        "ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume",
+        "sent_hour","fg_idx","rv_w6","rv_w36","vol_z"
     ]
-    feat = feat[all_cols].dropna()
-    y = y.loc[feat.index].dropna()
+    X = d[feat_cols].astype("float32")
+    xy = pd.concat([X, y.rename("y")], axis=1).dropna()
+    return xy[feat_cols], xy["y"]
 
-    # aligner X et y (on retire la dernière ligne si la cible est NaN après shift)
-    common_idx = feat.index.intersection(y.index)
-    X = feat.loc[common_idx].astype("float32")
-    y = y.loc[common_idx].astype("int8")
-
-    return X, y
-
-
-# ---------- entraînement ----------
 def train_models() -> None:
     """
-    Entraîne un modèle compact par symbole et le sauvegarde compressé (<100MB),
-    avec **calibrage des probabilités** (sigmoid, CV=5).
+    Entraîne un classifieur calibré (SGD->Platt scaling) par symbole,
+    et sauvegarde le modèle + la liste des features utilisées.
     """
-    df_all = pd.read_csv(CSV_PATH)
-    print(f"📦 training_data.csv lu : {len(df_all)} lignes, {df_all['symbol'].nunique()} symboles.")
+    df_all = pd.read_csv(CSV_PATH, parse_dates=["ts"])
+    df_all["ts"] = pd.to_datetime(df_all["ts"], utc=True)
+
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
     symbols = sorted(df_all["symbol"].unique())
-    for symbol in symbols:
-        df = df_all[df_all["symbol"] == symbol].copy()
-        X, y = _build_features_train(df)
+    vol_window = int(getattr(settings, "vol_window", 12))
 
-        if len(X) < 300:
-            print(f"⚠️  Trop peu d'observations pour {symbol} — skip ({len(X)} lignes).")
+    for symbol in symbols:
+        src = df_all[df_all["symbol"] == symbol].copy()
+        if len(src) < 300:
+            print(f"⚠️  Trop peu d'observations pour {symbol} — skip.")
             continue
 
-        # Modèle base (compact) + score CV pour info (non calibré)
-        base_model = RandomForestClassifier(
-            n_estimators=120,
-            max_depth=8,
-            min_samples_leaf=5,
-            n_jobs=-1,
-            random_state=42,
+        # build full features
+        full = _build_full_features(src[["ts","open","high","low","close","volume"]], vol_window=vol_window)
+        # on réinjecte 'close' pour la cible
+        full = full.merge(src[["ts","close"]], on="ts", how="left").ffill()
+
+        X, y = _make_Xy(full)
+        if len(X) < 200:
+            print(f"⚠️  Pas assez de lignes après features pour {symbol} — skip.")
+            continue
+
+        # split chrono: 80% train, 20% calibration
+        split = int(len(X) * 0.8)
+        X_train, y_train = X.iloc[:split], y.iloc[:split]
+        X_cal, y_cal = X.iloc[split:], y.iloc[split:]
+
+        # pipeline + calibration (Platt / sigmoid)
+        base = make_pipeline(
+            StandardScaler(with_mean=True),
+            SGDClassifier(loss="log_loss",
+                          class_weight="balanced",
+                          random_state=42,
+                          max_iter=2000,
+                          tol=1e-3)
         )
-        tscv = TimeSeriesSplit(n_splits=5)
-        try:
-            scores = cross_val_score(base_model, X.values, y.values, cv=tscv, scoring="roc_auc", n_jobs=-1)
-            print(f"📈 {symbol} | AUC CV (RF non calibrée): {scores.mean():.3f} ± {scores.std():.3f}")
-        except Exception as e:
-            print(f"[WARN] CV échouée pour {symbol}: {e}")
+        base.fit(X_train, y_train)
 
-        # Calibrage (Platt / sigmoid) avec CV=5
-        model = CalibratedClassifierCV(estimator=base_model, method="sigmoid", cv=5)
-        model.fit(X.values, y.values)
+        calib = CalibratedClassifierCV(base, cv="prefit", method="sigmoid")
+        calib.fit(X_cal, y_cal)
 
-        # Sauvegarde compressée
         model_path = MODELS_DIR / f"{symbol.replace('/','_')}_model.pkl"
-        joblib.dump(model, model_path, compress=3)
-        print(f"✅ Modèle calibré sauvegardé (compressé) : {model_path}  | X shape={X.shape}")
+        payload = {
+            "model": calib,
+            "features": list(X.columns),   # pour aligner à l’inférence
+            "vol_window": vol_window
+        }
+        joblib.dump(payload, model_path, compress=3)
+        print(f"✅ Modèle calibré sauvegardé : {model_path} (rows={len(X)})")
 
     # petit rapport
     (DATA_DIR / "ml_training_report.csv").write_text(
         f"rows,{len(df_all)}\nsymbols,{','.join(symbols)}\n", encoding="utf-8"
     )
-    print("✅ Entraînement terminé (modèles calibrés + rapport).")
-
+    print("✅ Entraînement terminé (calibré).")
 
 def main():
     ensure_training_csv()
     train_models()
-
 
 if __name__ == "__main__":
     main()
