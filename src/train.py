@@ -1,15 +1,14 @@
 # src/train.py
 from __future__ import annotations
+import time
 from pathlib import Path
 from typing import Tuple
-from datetime import datetime, timezone
-import time
 
 import numpy as np
 import pandas as pd
 import joblib
 
-from sklearn.linear_model import SGDClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -22,7 +21,7 @@ DATA_DIR = settings.data_dir
 CSV_PATH = DATA_DIR / "training_data.csv"
 MODELS_DIR = Path("models")
 
-# ---------------- helpers ----------------
+# ------------- helpers -------------
 def _parse_symbols() -> list[str]:
     if isinstance(settings.symbols, (list, tuple)):
         return [s.strip() for s in settings.symbols if s.strip()]
@@ -43,13 +42,18 @@ def ensure_training_csv() -> None:
     if CSV_PATH.exists():
         print(f"✅ {CSV_PATH} existe déjà — on continue.")
         return
-    print("⚠️  training_data.csv introuvable — génération depuis l'exchange...")
+
+    print("⚠️  training_data.csv introuvable — génération automatique depuis l'exchange...")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
     ex = make_client()
     symbols = _parse_symbols()
+    timeframe = settings.timeframe
+    limit = settings.limit
+
     frames = []
     for sym in symbols:
-        ohlcv = _safe_fetch_ohlcv(ex, sym, settings.timeframe, settings.limit)
+        ohlcv = _safe_fetch_ohlcv(ex, sym, timeframe=timeframe, limit=limit)
         if not ohlcv:
             print(f"⚠️  Aucune donnée pour {sym} — ignoré.")
             continue
@@ -57,46 +61,51 @@ def ensure_training_csv() -> None:
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         df["symbol"] = sym
         frames.append(df)
+
     if not frames:
         raise RuntimeError("Aucune donnée téléchargée — impossible de créer training_data.csv")
+
     out = pd.concat(frames, ignore_index=True).sort_values(["symbol", "ts"])
     out.to_csv(CSV_PATH, index=False)
     print(f"✅ Données créées : {CSV_PATH.resolve()} (rows={len(out)})")
 
-# ---------- features ----------
+# ---------- features techniques ----------
 def _build_features_tech(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
     d = df.copy()
     d["ret_1"] = d["close"].pct_change()
-    d["roll_mean"] = d["close"].rolling(vol_window, min_periods=max(2, vol_window//2)).mean()
-    d["roll_std"] = d["close"].rolling(vol_window, min_periods=max(2, vol_window//2)).std()
+    d["roll_mean"] = d["close"].rolling(vol_window, min_periods=vol_window//2 or 1).mean()
+    d["roll_std"]  = d["close"].rolling(vol_window, min_periods=vol_window//2 or 1).std()
+
     delta = d["close"].diff()
-    up = np.where(delta > 0, delta, 0.0)
+    up   = np.where(delta > 0, delta, 0.0)
     down = np.where(delta < 0, -delta, 0.0)
     r_up = pd.Series(up, index=d.index).rolling(14, min_periods=7).mean()
     r_dn = pd.Series(down, index=d.index).rolling(14, min_periods=7).mean()
     rs = r_up / r_dn.replace(0, np.nan)
     d["rsi"] = 100 - (100 / (1 + rs))
+
     d["hl_range"] = (d["high"] - d["low"]) / d["close"].replace(0, np.nan)
-    d["price_z"] = (d["close"] - d["roll_mean"]) / d["roll_std"].replace(0, np.nan)
-    tech = d[["ts","ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume"]]
-    return tech
+    d["price_z"]  = (d["close"] - d["roll_mean"]) / d["roll_std"].replace(0, np.nan)
+    return d[["ts","ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume"]]
 
 def _build_full_features(df_price: pd.DataFrame, vol_window: int) -> pd.DataFrame:
-    tech = _build_features_tech(df_price, vol_window=vol_window).dropna().copy()
-    alt = build_alt_features(df_price[["ts","close","volume"]]).reset_index()
-    full = (tech.merge(alt, on="ts", how="left")
-                 .merge(df_price[["ts","close"]], on="ts", how="left"))
-    full = full.sort_values("ts").ffill().dropna().reset_index(drop=True)
+    tech = _build_features_tech(df_price, vol_window=vol_window)
+    alt  = build_alt_features(df_price[["ts","close","volume"]])
+    full = (tech.merge(alt.reset_index(), on="ts", how="left").sort_values("ts"))
+    full = full.set_index("ts").ffill().dropna().reset_index()
+    # on réinjecte 'close' pour calculer la cible
+    full = full.merge(df_price[["ts","close"]], on="ts", how="left").ffill()
     return full
 
-def _make_Xy(df_full: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+def _make_Xy(df_full: pd.DataFrame):
+    d = df_full.copy()
+    d["future_ret"] = d["close"].pct_change().shift(-1)
+    y = (d["future_ret"] > 0).astype("int8")
+
     feat_cols = [
         "ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume",
         "sent_hour","fg_idx","rv_w6","rv_w36","vol_z"
     ]
-    d = df_full.copy()
-    d["future_ret"] = d["close"].pct_change().shift(-1)
-    y = (d["future_ret"] > 0).astype("int8")
     X = d[feat_cols].astype("float32")
     xy = pd.concat([X, y.rename("y")], axis=1).dropna()
     return xy[feat_cols], xy["y"]
@@ -115,42 +124,48 @@ def train_models() -> None:
             print(f"⚠️  Trop peu d'observations pour {symbol} — skip.")
             continue
 
-        full = _build_full_features(src[["ts","open","high","low","close","volume"]], vol_window)
-        if len(full) < 200:
-            print(f"⚠️  Pas assez de lignes après feature engineering pour {symbol} — skip.")
+        full = _build_full_features(src[["ts","open","high","low","close","volume"]], vol_window=vol_window)
+        X, y = _make_Xy(full)
+        if len(X) < 200:
+            print(f"⚠️  Pas assez de lignes après features pour {symbol} — skip.")
             continue
 
-        X, y = _make_Xy(full)
+        # split chrono 80/20 pour calibration
+        split = int(len(X) * 0.8)
+        X_train, y_train = X.iloc[:split], y.iloc[:split]
+        X_cal,   y_cal   = X.iloc[split:],  y.iloc[split:]
 
-        # Pipeline + calibration CV=3 (isotonic) — robuste et évite proba extrêmes
         base = make_pipeline(
             StandardScaler(with_mean=True),
-            SGDClassifier(
-                loss="log_loss",
+            LogisticRegression(
+                solver="saga",           # robuste, gère le standard scaling
+                penalty="l2",
+                C=0.5,                   # régularisation ↑ => proba moins extrêmes
                 class_weight="balanced",
-                random_state=42,
-                max_iter=5000,
-                tol=1e-4,
-            ),
+                max_iter=2000,
+                n_jobs=-1,
+                random_state=42
+            )
         )
-        # Calibration croisée — refit sur chaque fold, calibration sur les out-of-fold
-        calib = CalibratedClassifierCV(base, cv=3, method="isotonic")
-        calib.fit(X.values, y.values)
+        base.fit(X_train, y_train)
 
+        clf = CalibratedClassifierCV(base, cv="prefit", method="sigmoid")
+        clf.fit(X_cal, y_cal)
+
+        model_path = MODELS_DIR / f"{symbol.replace('/','_')}_model.pkl"
         payload = {
-            "model": calib,
+            "model": clf,
             "features": list(X.columns),
             "vol_window": vol_window,
-            "trained_at": datetime.now(timezone.utc).isoformat(),
+            "temperature": 1.8  # <-- adoucit encore les proba à l'inférence
         }
-        model_path = MODELS_DIR / f"{symbol.replace('/','_')}_model.pkl"
         joblib.dump(payload, model_path, compress=3)
-        print(f"✅ Modèle calibré sauvegardé : {model_path} (rows={len(X)})")
+        print(f"✅ Modèle calibré (LR+sigmoid) sauvegardé : {model_path} (rows={len(X)})")
 
     (DATA_DIR / "ml_training_report.csv").write_text(
         f"rows,{len(df_all)}\nsymbols,{','.join(symbols)}\n", encoding="utf-8"
     )
-    print("✅ Entraînement terminé (calibré isotone CV=3).")
+    print("✅ Entraînement terminé.")
 
 def main():
     ensure_training_csv()
