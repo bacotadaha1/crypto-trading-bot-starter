@@ -2,16 +2,15 @@ name: Daily Predict (Telegram)
 
 on:
   schedule:
-    - cron: "00 06 * * *"   # 06:00 UTC
+    - cron: "0 6 * * *"   # 06:00 UTC
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # on pousse seulement preds_log.csv
+  contents: write
 
 jobs:
   predict:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,20 +24,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install joblib requests
 
-      # 1) Essaye d'abord les modèles "online" (incrémental) du dernier run
-      - name: Try download ONLINE models (if any)
-        continue-on-error: true
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          workflow: daily_online_update.yml
-          workflow_conclusion: success
-          name: trained-models-online
-          path: .
-
-      # 2) Si aucun modèle récupéré, fallback sur le retrain quotidien
-      - name: Fallback to RETRAIN models
-        if: ${{ !hashFiles('models/*_model.pkl') }}
+      # 👉 On prend uniquement les modèles du retrain (stables)
+      - name: Download retrained models
         uses: dawidd6/action-download-artifact@v6
         with:
           workflow: daily_retrain.yml
@@ -48,9 +37,7 @@ jobs:
 
       - name: Show models content
         run: |
-          echo "== repo root =="
-          ls -lah
-          echo "== models =="
+          echo "== models/ =="
           ls -lah models || true
 
       - name: Run daily prediction (sends Telegram)
@@ -59,12 +46,12 @@ jobs:
           SYMBOLS: ${{ vars.SYMBOLS || 'BTC/USDT,ETH/USDT,SOL/USDT' }}
           TIMEFRAME: ${{ vars.TIMEFRAME || '4h' }}
           LIMIT: ${{ vars.LIMIT || '5000' }}
+          DATA_DIR: ./data
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -m src.predict
 
-      # On versionne SEULEMENT le journal des prédictions
       - name: Commit & push preds_log.csv
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
