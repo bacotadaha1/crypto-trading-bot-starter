@@ -12,45 +12,76 @@ import pandas as pd
 import joblib
 
 from src.config import settings
-from src.ingestion import make_client
-from src.alt_data import build_alt_features
+from src.ingestion import make_client                 # client CCXT
+from src.alt_data import build_alt_features           # sentiment + regime features
 
-# ---- helpers ----
+
+# ============================ small utils ============================
+
 def _sym_to_fname(symbol: str) -> str:
     return symbol.replace("/", "_").replace("-", "_").upper()
 
+def _logit(p: float) -> float:
+    p = min(max(float(p), 1e-6), 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
+def _inv_logit(z: float) -> float:
+    return 1.0 / (1.0 + math.exp(-z))
+
+def _apply_temperature(p: float, T: float) -> float:
+    """Adoucit une proba via temperature scaling (T>1 => proba moins extrêmes)."""
+    return float(_inv_logit(_logit(p) / max(T, 1e-6)))
+
+
+# ============================ features ============================
+
 def _build_tech_features(df: pd.DataFrame, vol_window: int) -> pd.DataFrame:
+    """
+    7 features techniques alignées sur ts (UTC).
+    """
     d = df.copy()
     d["ret_1"] = d["close"].pct_change()
-    d["roll_mean"] = d["close"].rolling(vol_window, min_periods=max(2, vol_window//2)).mean()
-    d["roll_std"]  = d["close"].rolling(vol_window, min_periods=max(2, vol_window//2)).std()
+    d["roll_mean"] = d["close"].rolling(vol_window, min_periods=vol_window // 2 or 1).mean()
+    d["roll_std"]  = d["close"].rolling(vol_window, min_periods=vol_window // 2 or 1).std()
+
     delta = d["close"].diff()
-    up = np.where(delta > 0, delta, 0.0)
+    up   = np.where(delta > 0, delta, 0.0)
     down = np.where(delta < 0, -delta, 0.0)
     r_up = pd.Series(up, index=d.index).rolling(14, min_periods=7).mean()
     r_dn = pd.Series(down, index=d.index).rolling(14, min_periods=7).mean()
     rs = r_up / r_dn.replace(0, np.nan)
     d["rsi"] = 100 - (100 / (1 + rs))
+
     d["hl_range"] = (d["high"] - d["low"]) / d["close"].replace(0, np.nan)
-    d["price_z"] = (d["close"] - d["roll_mean"]) / d["roll_std"].replace(0, np.nan)
-    return d[["ts","ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume"]]
+    d["price_z"]  = (d["close"] - d["roll_mean"]) / d["roll_std"].replace(0, np.nan)
+
+    tech = d[["ts","ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume"]].copy()
+    tech["ts"] = pd.to_datetime(tech["ts"], utc=True)
+    return tech.dropna()
+
 
 def _build_all_features(df_price: pd.DataFrame, vol_window: int) -> pd.DataFrame:
-    tech = _build_tech_features(df_price, vol_window).dropna().copy()
-    alt = build_alt_features(df_price[["ts","close","volume"]])
-    tech["ts"] = pd.to_datetime(tech["ts"], utc=True)
-    tech = tech.set_index("ts").sort_index()
-    all_feats = tech.join(alt, how="left")
+    """
+    Construit le *set complet* (12 colonnes possibles) indexé par ts:
+      - 7 techniques: ret_1, roll_mean, roll_std, rsi, hl_range, price_z, volume
+      - 5 alt-data  : sent_hour, fg_idx, rv_w6, rv_w36, vol_z
+    """
+    tech = _build_tech_features(df_price, vol_window).set_index("ts").sort_index()
 
-    # créer colonnes alt manquantes si besoin
-    for col in ["sent_hour","fg_idx","rv_w6","rv_w36","vol_z"]:
-        if col not in all_feats.columns:
-            all_feats[col] = np.nan
-    # ffill puis replace na restants par 0 (alt-data seulement)
-    all_feats[["sent_hour","fg_idx","rv_w6","rv_w36","vol_z"]] = (
-        all_feats[["sent_hour","fg_idx","rv_w6","rv_w36","vol_z"]].ffill().fillna(0.0)
-    )
-    return all_feats
+    # alt features (déjà indexées par ts)
+    alt = build_alt_features(df_price[["ts", "close", "volume"]])
+
+    feats = tech.join(alt, how="left")
+    for col in ["sent_hour", "fg_idx", "rv_w6", "rv_w36", "vol_z"]:
+        if col not in feats.columns:
+            feats[col] = np.nan
+
+    feats = feats.replace([np.inf, -np.inf], np.nan).fillna(method="ffill")
+    feats = feats.fillna(0.0)
+    return feats
+
+
+# ============================ IO helpers ============================
 
 def _send_telegram(msg: str) -> None:
     token = getattr(settings, "telegram_bot_token", "") or ""
@@ -68,46 +99,77 @@ def _send_telegram(msg: str) -> None:
     except Exception as e:
         print("[WARN] Telegram error:", e)
 
+
 def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
+
 def load_model_for(symbol: str):
+    """
+    Retourne (estimator, feat_cols, vol_window, temperature, path).
+    Compatible nouveaux modèles (dict avec clés) et anciens (estimator seul).
+    """
     path = Path("models") / f"{_sym_to_fname(symbol)}_model.pkl"
     if not path.exists():
         raise FileNotFoundError(f"Aucun modèle trouvé pour {symbol} dans ./models/")
+
     obj = joblib.load(path)
+
+    # Nouveau format (dict)
     if isinstance(obj, dict) and "model" in obj:
         model = obj["model"]
         feat_cols = list(obj.get("features", []))
         vol_window = int(obj.get("vol_window", getattr(settings, "vol_window", 12)))
-        return model, feat_cols, vol_window, path
-    # fallback anciens modèles: 7 features techniques
-    return obj, ["ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume"], int(getattr(settings, "vol_window", 12)), path
+        temperature = float(obj.get("temperature", 1.0))
+        if not feat_cols:
+            feat_cols = [
+                "ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume",
+                "sent_hour","fg_idx","rv_w6","rv_w36","vol_z"
+            ]
+        return model, feat_cols, vol_window, temperature, path
 
-def _proba_up_from_model(model, X_last: np.ndarray) -> float:
+    # Ancien format
+    legacy_cols = ["ret_1","roll_mean","roll_std","rsi","hl_range","price_z","volume"]
+    return obj, legacy_cols, int(getattr(settings, "vol_window", 12)), 1.0, path
+
+
+def _proba_up_from_model(model, X_last: np.ndarray, temperature: float = 1.0) -> float:
+    """
+    Proba d'UP avec température et léger clipping pour éviter 0/1 exacts.
+    """
     try:
         if hasattr(model, "predict_proba"):
-            return float(model.predict_proba(X_last)[0, -1])
-        if hasattr(model, "decision_function"):
+            p = float(model.predict_proba(X_last)[0, -1])
+        elif hasattr(model, "decision_function"):
             z = float(model.decision_function(X_last)[0])
-            return 1.0 / (1.0 + math.exp(-z))
-        yv = float(model.predict(X_last)[0])
-        return 1.0 / (1.0 + math.exp(-2.5 * yv))
+            p = _inv_logit(z)
+        else:
+            yv = float(model.predict(X_last)[0])
+            p = _inv_logit(2.5 * yv)
     except Exception as e:
         print("[WARN] proba_from_model:", e)
-        return 0.5
+        p = 0.5
 
-# ---- prediction ----
+    p = _apply_temperature(p, temperature)
+    p = float(np.clip(p, 0.02, 0.98))  # bornes douces
+    return p
+
+
+# ============================ core ============================
+
 def predict_one_symbol(ex, symbol: str) -> dict:
-    dfp = fetch_ohlcv_df(ex, symbol, settings.timeframe, settings.limit)
+    # 1) Prix bruts
+    df_price = fetch_ohlcv_df(ex, symbol, settings.timeframe, settings.limit)
 
-    model, feat_cols_expected, vol_window, model_path = load_model_for(symbol)
-    feats_all = _build_all_features(dfp, vol_window)
+    # 2) Modèle + colonnes attendues
+    model, feat_cols_expected, vol_window, temperature, model_path = load_model_for(symbol)
 
-    # s'assurer que TOUTES les colonnes attendues existent
+    # 3) Features complètes -> sélection des colonnes du modèle
+    feats_all = _build_all_features(df_price, vol_window)
+
     for col in feat_cols_expected:
         if col not in feats_all.columns:
             feats_all[col] = 0.0
@@ -118,16 +180,13 @@ def predict_one_symbol(ex, symbol: str) -> dict:
     if len(X) == 0:
         raise ValueError(f"Pas assez d’observations pour construire {len(feat_cols_expected)} features.")
 
+    # 4) Prédiction sur la dernière ligne
     x_last = X.iloc[-1:].to_numpy(dtype=float)
-    p_up = _proba_up_from_model(model, x_last)
-
-    # clip doux pour éviter 0/1 affichés si le modèle dérape
-    eps = float(getattr(settings, "proba_clip_eps", 0.01))
-    p_up = float(np.clip(p_up, eps, 1.0 - eps))
-
+    p_up = _proba_up_from_model(model, x_last, temperature=temperature)
     direction = "UP" if p_up >= 0.5 else "DOWN"
-    last_close = float(dfp["close"].iloc[-1])
-    tstamp = dfp["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
+
+    last_close = float(df_price["close"].iloc[-1])
+    tstamp = df_price["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
 
     return {
         "symbol": symbol,
@@ -139,8 +198,11 @@ def predict_one_symbol(ex, symbol: str) -> dict:
         "used_features": feat_cols_expected,
     }
 
+
 def main():
     ex = make_client()
+
+    # s'assurer que settings.symbols soit une liste
     symbols = settings.symbols
     if isinstance(symbols, str):
         symbols = [s.strip() for s in symbols.split(",") if s.strip()]
@@ -148,10 +210,12 @@ def main():
     results: list[dict] = []
     for symbol in symbols:
         try:
-            results.append(predict_one_symbol(ex, symbol))
+            res = predict_one_symbol(ex, symbol)
+            results.append(res)
         except Exception as e:
             results.append({"symbol": symbol, "error": str(e)})
 
+    # --- message Telegram
     limit_txt = f"  Limit: {settings.limit}" if hasattr(settings, "limit") else ""
     lines = [
         "*Signal quotidien (ML + Sentiment)*",
@@ -162,24 +226,26 @@ def main():
     for r in results:
         if "error" in r:
             lines.append(f"• *{r['symbol']}* → `ERREUR`: {r['error']}")
-        else:
-            conf = int(round(r["p_up"] * 100))
-            emoji = "🟢⬆️" if r["direction"] == "UP" else "🔴⬇️"
-            lines.append(
-                f"• *{r['symbol']}* @ {r['time']} {emoji}\n"
-                f"  Direction: *{r['direction']}*  | Confiance: *{conf}%*  | Close: `{r['last_close']}`"
-            )
+            continue
+        conf = int(round(r["p_up"] * 100))
+        conf = max(1, min(conf, 99))  # jamais 0/100 visuellement
+        emoji = "🟢⬆️" if r["direction"] == "UP" else "🔴⬇️"
+        lines.append(
+            f"• *{r['symbol']}* @ {r['time']} {emoji}\n"
+            f"  Direction: *{r['direction']}*  | Confiance: *{conf}%*  | Close: `{r['last_close']}`"
+        )
 
     msg = "\n".join(lines)
     print(msg)
     _send_telegram(msg)
 
-    # logs
+    # --- log JSON (facultatif)
     Path("data").mkdir(parents=True, exist_ok=True)
     out_json = Path("data") / f"predictions_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
+    # --- journalisation CSV (pour l'évaluation/diagnostic)
     log_path = Path("data") / "preds_log.csv"
     rows = []
     ts_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -187,20 +253,24 @@ def main():
         if "error" in r:
             rows.append({
                 "ts_utc": ts_now, "exchange": settings.exchange, "timeframe": settings.timeframe,
-                "symbol": r.get("symbol"), "last_close": None, "p_up": None, "direction": None, "error": r.get("error"),
+                "symbol": r.get("symbol"), "last_close": None, "p_up": None,
+                "direction": None, "error": r.get("error"),
             })
         else:
             rows.append({
                 "ts_utc": ts_now, "exchange": settings.exchange, "timeframe": settings.timeframe,
-                "symbol": r["symbol"], "last_close": r["last_close"], "p_up": r["p_up"],
-                "direction": r["direction"], "error": None,
+                "symbol": r["symbol"], "last_close": r["last_close"],
+                "p_up": r["p_up"], "direction": r["direction"], "error": None,
             })
+
     if rows:
         write_header = not log_path.exists()
         with log_path.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            if write_header: w.writeheader()
+            if write_header:
+                w.writeheader()
             w.writerows(rows)
+
 
 if __name__ == "__main__":
     main()
