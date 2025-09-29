@@ -1,16 +1,17 @@
-name: Daily Predict (Telegram)
+name: Daily Retrain
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 06:00 UTC
+    - cron: "0 5 * * *"   # 05:00 UTC, tous les jours
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
 jobs:
-  predict:
+  retrain:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,47 +27,33 @@ jobs:
           pip install -r requirements.txt
           pip install joblib requests
 
-      # 👉 On prend uniquement les modèles du retrain (stables)
-      - name: Download retrained models
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          workflow: daily_retrain.yml
-          workflow_conclusion: success
-          name: trained-models
-          path: .
-
-      - name: Show models content
+      - name: Debug settings (echo)
         run: |
-          echo "== models/ =="
-          ls -lah models || true
+          echo "Exchange = ${{ vars.EXCHANGE || 'kucoin' }}"
+          echo "Symbols = ${{ vars.SYMBOLS || 'BTC/USDT,ETH/USDT,SOL/USDT' }}"
+          echo "Timeframe = ${{ vars.TIMEFRAME || '4h' }}"
+          echo "Limit = ${{ vars.LIMIT || '5000' }}"
+          echo "Data dir = ./data"
 
-      - name: Run daily prediction (sends Telegram)
+      - name: Fetch OHLCV & train models
         env:
           EXCHANGE: ${{ vars.EXCHANGE || 'kucoin' }}
           SYMBOLS: ${{ vars.SYMBOLS || 'BTC/USDT,ETH/USDT,SOL/USDT' }}
           TIMEFRAME: ${{ vars.TIMEFRAME || '4h' }}
           LIMIT: ${{ vars.LIMIT || '5000' }}
           DATA_DIR: ./data
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python -m src.predict
+          python -m src.train
 
-      - name: Commit & push preds_log.csv
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Show models content (debug)
         run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@github.com"
-          mkdir -p data
-          git add data/preds_log.csv || true
-          git commit -m "Append daily prediction to preds_log.csv" || echo "Nothing to commit"
-          git push
+          echo "== models/ =="
+          ls -lah models || true
 
-      - name: Upload preds log artifact (optional)
+      - name: Upload trained models
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: preds-log
-          path: data/preds_log.csv
-          if-no-files-found: warn
+          name: trained-models
+          path: models
+          if-no-files-found: error
